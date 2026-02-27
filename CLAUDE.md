@@ -39,6 +39,10 @@ This project automates provisioning of Windows VMs with Active Directory, DHCP, 
 │   ├── inventory/         # VM definitions (hosts, IPs, roles)
 │   ├── playbooks/         # Automation playbooks
 │   └── roles/             # Reusable role definitions
+├── agent/                  # Infoblox Agent for Microsoft AD
+│   ├── install.yml        # Agent installation playbook
+│   ├── configure.yml      # Agent configuration
+│   └── vars/              # Agent variables
 └── CLAUDE.md              # This file
 ```
 
@@ -78,6 +82,66 @@ ansible-playbook -i ansible/inventory/hosts.yml ansible/playbooks/configure_dhcp
 # Test WinRM connection
 ansible -i ansible/inventory/hosts.yml <hostname> -m win_ping
 ```
+
+### Agent Installation (Infoblox Agent for Microsoft)
+
+Install Infoblox Agent on a domain member to sync DHCP/DNS from specified AD servers:
+
+```bash
+# Install and configure agent (single command)
+ansible-playbook -i ansible/inventory/hosts.yml agent/install.yml --limit <agent_host>
+```
+
+### Full Provisioning Workflow
+
+```bash
+# 1. Provision VMs
+cd terraform && terraform apply
+
+# 2. Configure AD, DHCP, DNS
+cd ansible && ansible-playbook -i inventory/hosts.yml playbooks/configure_all.yml
+
+# 3. Install Infoblox Agent (optional)
+ansible-playbook -i ansible/inventory/hosts.yml agent/install.yml --limit <agent_host>
+```
+
+## Agent Configuration
+
+The agent module handles the complete installation of Infoblox Agent for Microsoft:
+
+### Minimal Config (agent/vars/main.yml)
+
+```yaml
+# Download source - abstract interface (S3 URL, HTTP, etc.)
+download_url: "https://your-bucket.s3.amazonaws.com/infoblox_agent_for_microsoft_v1.35.38.msi"
+
+# Target AD servers to collect data from
+target_servers:
+  - 192.168.1.10   # DC with DNS/DHCP
+  - 192.168.1.11   # DC with DNS only
+
+# Service account credentials
+service_account:
+  username: "infoblox_agent"
+  password: "{{ vault_password }}"
+  domain: "corp.local"
+
+# SaaS portal
+portal_url: "https://portal.infoblox.com"
+api_key: "{{ vault_api_key }}"
+```
+
+### Agent Installation Steps
+
+The playbook performs these steps:
+
+1. **Create AD service account** - with read permissions for DNS/DHCP
+2. **Enable WinRM/PSRemote** - allow remote PowerShell execution
+3. **Configure firewall policies** - allow agent ports
+4. **Download agent** - fetch MSI from download URL
+5. **Install agent** - silent MSI installation
+6. **Configure agent** - set target servers and credentials
+7. **Start agent service** - ensure running and set to auto-start
 
 ### Full Provisioning Workflow
 
