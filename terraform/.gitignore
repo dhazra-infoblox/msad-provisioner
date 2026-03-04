@@ -1,0 +1,23 @@
+# Local .terraform directories
+.terraform/
+terraform.tfstate
+terraform.tfstate.backup
+*.tfvars
+!terraform.tfvars.example
+
+# Crash log files
+crash.log
+crash.*.log
+
+# Log files
+*.log
+
+# Override files
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Include override files you don't want to commit
+.terraformrc
+terraform.rc
