@@ -86,11 +86,12 @@ resource "vsphere_virtual_machine" "vm" {
 
 # Output: Created VMs
 output "provisioned_vms" {
-  description = "List of provisioned VM names and IPs"
+  description = "List of provisioned VM names and IDs"
   value = {
     for vm in vsphere_virtual_machine.vm :
     vm.name => {
-      ip_address = vm.clone[0].customize[0].ipv4_address
+      id   = vm.id
+      uuid = vm.uuid
     }
   }
 }
