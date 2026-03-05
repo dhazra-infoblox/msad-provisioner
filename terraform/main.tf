@@ -96,12 +96,13 @@ resource "vsphere_virtual_machine" "vm" {
 
 # Output: Created VMs
 output "provisioned_vms" {
-  description = "List of provisioned VM names and IDs"
+  description = "List of provisioned VMs with DHCP-assigned IPs"
   value = {
     for vm in vsphere_virtual_machine.vm :
     vm.name => {
-      id   = vm.id
-      uuid = vm.uuid
+      id              = vm.id
+      uuid            = vm.uuid
+      dhcp_ip_address = vm.default_ip_address
     }
   }
 }
@@ -135,5 +136,13 @@ output "lan_network_info" {
     id   = data.vsphere_network.network.id
     name = data.vsphere_network.network.name
     type = data.vsphere_network.network.type
+  }
+}
+
+output "vm_ips_for_ansible" {
+  description = "VM names and DHCP-assigned IPs for Ansible inventory"
+  value = {
+    for vm in vsphere_virtual_machine.vm :
+    vm.name => vm.default_ip_address
   }
 }
