@@ -44,6 +44,11 @@ data "vsphere_virtual_machine" "template" {
   datacenter_id = data.vsphere_datacenter.dc.id
 }
 
+data "vsphere_virtual_machine" "existing_vm" {
+  name          = "test_dc_001"
+  datacenter_id = data.vsphere_datacenter.dc.id
+}
+
 # Create VMs from template
 resource "vsphere_virtual_machine" "vm" {
   for_each = var.vms
@@ -62,11 +67,16 @@ resource "vsphere_virtual_machine" "vm" {
   num_cpus  = each.value.cpu
   memory    = each.value.memory
   guest_id  = data.vsphere_virtual_machine.template.guest_id
+  firmware  = "efi"
+
+  # Storage
+  scsi_type = "lsilogic-sas"
 
   # Network
   network_interface {
-    adapter_type = "vmxnet3"
-    network_id   = data.vsphere_network.network.id
+    adapter_type          = "e1000e"
+    bandwidth_share_count = 50
+    network_id            = data.vsphere_network.network.id
   }
 
   # Disk
@@ -102,5 +112,28 @@ output "template_info" {
     id       = data.vsphere_virtual_machine.template.id
     name     = data.vsphere_virtual_machine.template.name
     guest_id = data.vsphere_virtual_machine.template.guest_id
+  }
+}
+
+
+output "existing_vm_config" {
+  description = "Existing VM configuration details"
+  value = {
+    guest_id           = data.vsphere_virtual_machine.existing_vm.guest_id
+    num_cpus           = data.vsphere_virtual_machine.existing_vm.num_cpus
+    memory             = data.vsphere_virtual_machine.existing_vm.memory
+    firmware           = data.vsphere_virtual_machine.existing_vm.firmware
+    scsi_type          = data.vsphere_virtual_machine.existing_vm.scsi_type
+    disks              = data.vsphere_virtual_machine.existing_vm.disks
+    network_interfaces = data.vsphere_virtual_machine.existing_vm.network_interfaces
+  }
+}
+
+output "lan_network_info" {
+  description = "LAN Network configuration"
+  value = {
+    id   = data.vsphere_network.network.id
+    name = data.vsphere_network.network.name
+    type = data.vsphere_network.network.type
   }
 }
