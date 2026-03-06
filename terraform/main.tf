@@ -58,9 +58,23 @@ resource "vsphere_virtual_machine" "vm" {
   resource_pool_id = data.vsphere_compute_cluster.cluster.resource_pool_id
   datastore_id     = data.vsphere_datastore.datastore.id
 
-  # Clone from template
+  # Clone from template with network customization
   clone {
     template_uuid = data.vsphere_virtual_machine.template.id
+
+    customize {
+      windows_options {
+        computer_name = each.value.name
+      }
+
+      network_interface {
+        ipv4_address = each.value.ip_address
+        ipv4_netmask = 24
+      }
+
+      ipv4_gateway    = each.value.gateway
+      dns_server_list = each.value.dns_servers
+    }
   }
 
   # CPU and Memory
@@ -86,23 +100,22 @@ resource "vsphere_virtual_machine" "vm" {
     thin_provisioned = true
   }
 
-  # Guest Customization for DHCP (initial - Ansible will set static IP)
-  # VM will boot with DHCP from vSphere network
-  # Static IP configuration is handled by Ansible
-
-  # Wait for guest OS to boot
-  wait_for_guest_ip_timeout = 0
+  # Wait for guest customization to complete
+  wait_for_guest_ip_timeout  = 5
+  wait_for_guest_net_timeout = 5
 }
 
 # Output: Created VMs
 output "provisioned_vms" {
-  description = "List of provisioned VMs with DHCP-assigned IPs"
+  description = "List of provisioned VMs with their configured static IPs"
   value = {
-    for vm in vsphere_virtual_machine.vm :
+    for key, vm in vsphere_virtual_machine.vm :
     vm.name => {
-      id              = vm.id
-      uuid            = vm.uuid
-      dhcp_ip_address = vm.default_ip_address
+      id         = vm.id
+      uuid       = vm.uuid
+      static_ip  = var.vms[key].ip_address
+      gateway    = var.vms[key].gateway
+      vsphere_ip = vm.default_ip_address
     }
   }
 }
@@ -140,9 +153,9 @@ output "lan_network_info" {
 }
 
 output "vm_ips_for_ansible" {
-  description = "VM names and DHCP-assigned IPs for Ansible inventory"
+  description = "VM names and configured static IPs for Ansible inventory"
   value = {
-    for vm in vsphere_virtual_machine.vm :
-    vm.name => vm.default_ip_address
+    for key, vm in vsphere_virtual_machine.vm :
+    vm.name => var.vms[key].ip_address
   }
 }
