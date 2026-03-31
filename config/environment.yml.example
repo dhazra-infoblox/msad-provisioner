@@ -1,0 +1,59 @@
+aws:
+  profile: your-aws-profile
+  region: us-east-1
+  vpc_id: vpc-xxxxxxxx
+  subnet_id: subnet-xxxxxxxx
+  security_group_ids:
+    - sg-xxxxxxxx
+  default_ami_id: ami-xxxxxxxxxxxxxxxxx
+  default_instance_type: t2.xlarge
+  associate_public_ip: false
+  key_name: your-key-pair
+  instance_profile_name: AmazonSSMRoleForInstancesQuickSetup
+  imds_http_tokens: optional
+  imds_instance_metadata_tags: disabled
+  root_volume_encrypted: true
+  # Optional KMS key for root disk encryption.
+  # root_volume_kms_key_id: arn:aws:kms:us-east-1:123456789012:key/your-key-id
+  name_prefix: msad_dhcp
+  environment: dev
+  tags:
+    owner: your-team
+
+domain:
+  fqdn: corp.local
+  netbios: CORP
+  admin_user: CORP\Administrator
+
+network:
+  # Optional. Defaults to first subnet host address (x.x.x.1).
+  # gateway: 172.28.4.1
+  # Optional. Defaults to bootstrap host assigned IP.
+  # dns_servers:
+  #   - 172.28.4.11
+  #   - 127.0.0.1
+  ip_start_offset: 10
+
+credentials:
+  service_user: infoblox_agent
+
+vault:
+  enabled: true
+  mount: secret
+  store_rdp_credentials: true
+  rdp_credentials_path_prefix: msad/rdp
+
+hosts:
+  - name: dhcp01
+    role: dhcp_server
+    bootstrap: true
+    instance_type: t3.large
+    disk_gb: 100
+  - name: dhcp02
+    role: dhcp_server
+    instance_type: t3.large
+    disk_gb: 100
+  - name: client01
+    role: agent_client
+    instance_type: t3.medium
+    disk_gb: 80

@@ -1,19 +1,54 @@
-# Terraform Outputs
-
-output "vms_created" {
-  description = "Map of created VMs with their names"
-  value       = [for vm in vsphere_virtual_machine.vm : vm.name]
+output "host_inventory" {
+  description = "Role, instance ID, and networking details for all hosts"
+  value = {
+    for name, vm in aws_instance.nodes :
+    name => {
+      role        = local.host_map[name].role
+      bootstrap   = try(local.host_map[name].bootstrap, false)
+      instance_id = vm.id
+      private_ip  = vm.private_ip
+      public_ip   = vm.public_ip
+    }
+  }
 }
 
-output "vm_details" {
-  description = "Details of each provisioned VM"
+output "dhcp_servers" {
+  description = "DHCP server endpoints configured for agent polling"
   value = {
-    for vm in vsphere_virtual_machine.vm :
-    vm.name => {
-      id       = vm.id
-      uuid     = vm.uuid
-      memory   = vm.memory
-      num_cpus = vm.num_cpus
-    }
+    for name in local.dhcp_hosts :
+    name => local.assigned_ips_by_host[name]
+  }
+}
+
+output "agent_servers" {
+  description = "Agent/client hosts and their IPs"
+  value = {
+    for name in local.agent_hosts :
+    name => local.assigned_ips_by_host[name]
+  }
+}
+
+output "phase_association_ids" {
+  description = "SSM association IDs for observability"
+  value = {
+    configure_networking    = { for k, v in aws_ssm_association.configure_networking : k => v.association_id }
+    install_windows_features = { for k, v in aws_ssm_association.install_windows_features : k => v.association_id }
+    bootstrap_domain        = aws_ssm_association.bootstrap_domain.association_id
+    join_domain             = { for k, v in aws_ssm_association.join_domain : k => v.association_id }
+    credential_setup        = aws_ssm_association.credential_setup.association_id
+    agent_setup             = { for k, v in aws_ssm_association.agent_setup : k => v.association_id }
+  }
+}
+
+output "bootstrap_host" {
+  description = "Designated forest bootstrap host"
+  value       = local.bootstrap_host
+}
+
+output "rdp_credentials_vault_paths" {
+  description = "Vault KV paths where per-host RDP credentials are stored"
+  value = {
+    for host, secret in vault_kv_secret_v2.rdp_credentials :
+    host => "${try(local.vault_cfg.mount, "secret")}/data/${secret.name}"
   }
 }
