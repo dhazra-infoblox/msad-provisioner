@@ -31,18 +31,25 @@ output "agent_servers" {
 output "phase_association_ids" {
   description = "SSM association IDs for observability"
   value = {
-    configure_networking    = { for k, v in aws_ssm_association.configure_networking : k => v.association_id }
+    rename_computer          = { for k, v in aws_ssm_association.rename_computer : k => v.association_id }
+    configure_networking     = { for k, v in aws_ssm_association.configure_networking : k => v.association_id }
     install_windows_features = { for k, v in aws_ssm_association.install_windows_features : k => v.association_id }
-    bootstrap_domain        = aws_ssm_association.bootstrap_domain.association_id
-    join_domain             = { for k, v in aws_ssm_association.join_domain : k => v.association_id }
-    credential_setup        = aws_ssm_association.credential_setup.association_id
-    agent_setup             = { for k, v in aws_ssm_association.agent_setup : k => v.association_id }
+    bootstrap_domain         = aws_ssm_association.bootstrap_domain.association_id
+    configure_dns_forwarder  = aws_ssm_association.configure_dns_forwarder.association_id
+    join_domain              = { for k, v in aws_ssm_association.join_domain : k => v.association_id }
+    credential_setup         = aws_ssm_association.credential_setup.association_id
+    agent_setup              = { for k, v in aws_ssm_association.agent_setup : k => v.association_id }
   }
 }
 
 output "bootstrap_host" {
   description = "Designated forest bootstrap host"
   value       = local.bootstrap_host
+}
+
+output "ssm_logs_s3_path" {
+  description = "S3 path for SSM command output logs"
+  value       = local.ssm_logs_enabled ? "s3://${local.ssm_log_bucket}/${local.ssm_log_prefix}/" : "disabled"
 }
 
 output "rdp_credentials_vault_paths" {

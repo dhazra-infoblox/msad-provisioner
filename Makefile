@@ -61,10 +61,10 @@ plan:
 	terraform -chdir=$(TF_DIR) plan $(TF_VARS)
 
 apply:
-	terraform -chdir=$(TF_DIR) apply $(TF_VARS)
+	terraform -chdir=$(TF_DIR) apply $(TF_VARS) --auto-approve
 
 destroy:
-	terraform -chdir=$(TF_DIR) destroy $(TF_VARS)
+	terraform -chdir=$(TF_DIR) destroy $(TF_VARS) --auto-approve
 
 output:
 	terraform -chdir=$(TF_DIR) output

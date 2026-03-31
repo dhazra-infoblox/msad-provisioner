@@ -10,6 +10,10 @@ terraform {
       source  = "hashicorp/vault"
       version = "~> 4.0"
     }
+    time = {
+      source  = "hashicorp/time"
+      version = "~> 0.9"
+    }
   }
 }
 
@@ -76,6 +80,8 @@ provider "aws" {
   region  = local.aws_config.region
   profile = local.aws_config.profile
 }
+
+data "aws_caller_identity" "current" {}
 
 data "aws_vpc" "selected" {
   id = local.aws_config.vpc_id
@@ -153,6 +159,16 @@ check "rdp_vault_prefix_set" {
   }
 }
 
+# ---------------------------------------------------------------------------
+# S3 path for SSM command output logs (existing bucket)
+# ---------------------------------------------------------------------------
+
+locals {
+  ssm_log_bucket = try(local.config.ssm_logs.s3_bucket, "")
+  ssm_log_prefix = try(local.config.ssm_logs.s3_prefix, "ssm-logs")
+  ssm_logs_enabled = local.ssm_log_bucket != ""
+}
+
 resource "aws_iam_role" "ssm_instance_role" {
   count = local.use_existing_instance_profile ? 0 : 1
 
@@ -183,6 +199,38 @@ resource "aws_iam_instance_profile" "ssm_instance_profile" {
 
   name = "${try(local.aws_config.name_prefix, "msad")}-instance-profile"
   role = aws_iam_role.ssm_instance_role[0].name
+}
+
+data "aws_iam_instance_profile" "existing" {
+  count = local.use_existing_instance_profile ? 1 : 0
+  name  = local.aws_config.instance_profile_name
+}
+
+locals {
+  ssm_role_name = local.use_existing_instance_profile ? data.aws_iam_instance_profile.existing[0].role_name : aws_iam_role.ssm_instance_role[0].name
+}
+
+resource "aws_iam_role_policy" "ssm_s3_logs" {
+  count = local.ssm_logs_enabled && !local.use_existing_instance_profile ? 1 : 0
+
+  name = "${try(local.aws_config.name_prefix, "msad")}-ssm-s3-logs"
+  role = local.ssm_role_name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:GetBucketLocation"
+      ]
+      Resource = [
+        "arn:aws:s3:::${local.ssm_log_bucket}",
+        "arn:aws:s3:::${local.ssm_log_bucket}/${local.ssm_log_prefix}/*"
+      ]
+    }]
+  })
 }
 
 resource "aws_instance" "nodes" {
@@ -239,8 +287,10 @@ resource "aws_ssm_document" "configure_networking" {
       name   = "ConfigureStaticIp"
       inputs = {
         runCommand = [
-          "$adapter = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | Select-Object -First 1",
-          "if (-not $adapter) { throw 'No active network adapter found' }",
+          "# Wait for CIM/WMI to be ready after reboot",
+          "$timeout = 180; $elapsed = 0; $adapter = $null",
+          "while ($elapsed -lt $timeout) { try { $adapter = Get-NetAdapter -ErrorAction Stop | Where-Object { $_.Status -eq 'Up' } | Select-Object -First 1; if ($adapter) { break } } catch { Write-Host \"Waiting for CIM/NetAdapter... ($elapsed s)\" }; Start-Sleep -Seconds 10; $elapsed += 10 }",
+          "if (-not $adapter) { throw 'No active network adapter found after waiting' }",
           "$ifIndex = $adapter.IfIndex",
           "Set-NetIPInterface -InterfaceIndex $ifIndex -AddressFamily IPv4 -Dhcp Disabled -ErrorAction SilentlyContinue",
           "$existingTarget = Get-NetIPAddress -InterfaceIndex $ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -eq '{{ StaticIp }}' }",
@@ -274,9 +324,23 @@ resource "aws_ssm_association" "configure_networking" {
     DnsList      = join(",", distinct(concat(local.dns_servers, [local.vpc_dns])))
   }
 
+  dynamic "output_location" {
+    for_each = local.ssm_logs_enabled ? [1] : []
+    content {
+      s3_bucket_name = local.ssm_log_bucket
+      s3_key_prefix  = "${local.ssm_log_prefix}/configure-networking/${each.key}"
+    }
+  }
+
   # Rename (with reboot) runs first while DHCP is active; then we set static
   # networking so no subsequent reboot can reset DNS settings.
-  wait_for_success_timeout_seconds = 900
+  wait_for_success_timeout_seconds = 300
+
+  depends_on = [time_sleep.wait_for_rename_reboot]
+}
+
+resource "time_sleep" "wait_for_rename_reboot" {
+  create_duration = "90s"
 
   depends_on = [aws_ssm_association.rename_computer]
 }
@@ -323,8 +387,16 @@ resource "aws_ssm_association" "rename_computer" {
     Hostname = upper(each.key)
   }
 
+  dynamic "output_location" {
+    for_each = local.ssm_logs_enabled ? [1] : []
+    content {
+      s3_bucket_name = local.ssm_log_bucket
+      s3_key_prefix  = "${local.ssm_log_prefix}/rename-computer/${each.key}"
+    }
+  }
+
   # Runs first on DHCP (SSM/DNS still work). Reboot happens here.
-  wait_for_success_timeout_seconds = 600
+  wait_for_success_timeout_seconds = 300
 }
 
 resource "aws_ssm_document" "install_windows_features" {
@@ -344,8 +416,8 @@ resource "aws_ssm_document" "install_windows_features" {
       inputs = {
         runCommand = [
           "# Wait for CBS (component store) to be ready after a reboot",
-          "$timeout = 300; $elapsed = 0",
-          "while ($elapsed -lt $timeout) { $cbs = Get-Service -Name TrustedInstaller -ErrorAction SilentlyContinue; if ($cbs -and $cbs.Status -eq 'Running') { break }; Start-Sleep -Seconds 10; $elapsed += 10; Write-Host \"Waiting for TrustedInstaller... ($elapsed s)\" }",
+          "$timeout = 600; $elapsed = 0",
+          "while ($elapsed -lt $timeout) { $cbs = Get-Service -Name TrustedInstaller -ErrorAction SilentlyContinue; if ($cbs) { if ($cbs.Status -ne 'Running') { Start-Service TrustedInstaller -ErrorAction SilentlyContinue }; if ($cbs.Status -eq 'Running') { break } }; Start-Sleep -Seconds 10; $elapsed += 10; Write-Host \"Waiting for TrustedInstaller... ($elapsed s)\" }",
           "if ($elapsed -ge $timeout) { throw 'TrustedInstaller did not start within timeout' }",
           "$role = '{{ HostRole }}'",
           "if ($role -eq 'dhcp_server' -or $role -eq 'domain_controller') { Install-WindowsFeature -Name DHCP,DNS,RSAT-DHCP,RSAT-DNS-Server,RSAT-AD-Tools -IncludeManagementTools }",
@@ -369,6 +441,14 @@ resource "aws_ssm_association" "install_windows_features" {
 
   parameters = {
     HostRole = local.host_map[each.key].role
+  }
+
+  dynamic "output_location" {
+    for_each = local.ssm_logs_enabled ? [1] : []
+    content {
+      s3_bucket_name = local.ssm_log_bucket
+      s3_key_prefix  = "${local.ssm_log_prefix}/install-features/${each.key}"
+    }
   }
 
   wait_for_success_timeout_seconds = 1800
@@ -417,8 +497,16 @@ resource "aws_ssm_association" "bootstrap_domain" {
     SafeModePass  = local.safe_mode_password
   }
 
+  dynamic "output_location" {
+    for_each = local.ssm_logs_enabled ? [1] : []
+    content {
+      s3_bucket_name = local.ssm_log_bucket
+      s3_key_prefix  = "${local.ssm_log_prefix}/bootstrap-domain"
+    }
+  }
+
   # Forest creation triggers a reboot; allow enough time for reboot + AD startup.
-  wait_for_success_timeout_seconds = 2400
+  wait_for_success_timeout_seconds = 1200
 
   depends_on = [aws_ssm_association.install_windows_features]
 }
@@ -463,7 +551,21 @@ resource "aws_ssm_association" "configure_dns_forwarder" {
     VpcDns = local.vpc_dns
   }
 
-  wait_for_success_timeout_seconds = 600
+  dynamic "output_location" {
+    for_each = local.ssm_logs_enabled ? [1] : []
+    content {
+      s3_bucket_name = local.ssm_log_bucket
+      s3_key_prefix  = "${local.ssm_log_prefix}/dns-forwarder"
+    }
+  }
+
+  wait_for_success_timeout_seconds = 120
+
+  depends_on = [time_sleep.wait_for_bootstrap_reboot]
+}
+
+resource "time_sleep" "wait_for_bootstrap_reboot" {
+  create_duration = "120s"
 
   depends_on = [aws_ssm_association.bootstrap_domain]
 }
@@ -513,8 +615,16 @@ resource "aws_ssm_association" "join_domain" {
     AdminPass  = local.domain_admin_password
   }
 
+  dynamic "output_location" {
+    for_each = local.ssm_logs_enabled ? [1] : []
+    content {
+      s3_bucket_name = local.ssm_log_bucket
+      s3_key_prefix  = "${local.ssm_log_prefix}/join-domain/${each.key}"
+    }
+  }
+
   # Domain join triggers a reboot; allow enough time for reboot + re-registration.
-  wait_for_success_timeout_seconds = 1800
+  wait_for_success_timeout_seconds = 600
 
   depends_on = [aws_ssm_association.configure_dns_forwarder]
 }
@@ -570,7 +680,21 @@ resource "aws_ssm_association" "credential_setup" {
     TrustedHosts = join(",", [for name in local.dhcp_hosts : local.assigned_ips_by_host[name]])
   }
 
-  wait_for_success_timeout_seconds = 600
+  dynamic "output_location" {
+    for_each = local.ssm_logs_enabled ? [1] : []
+    content {
+      s3_bucket_name = local.ssm_log_bucket
+      s3_key_prefix  = "${local.ssm_log_prefix}/credential-setup"
+    }
+  }
+
+  wait_for_success_timeout_seconds = 300
+
+  depends_on = [time_sleep.wait_for_join_reboot]
+}
+
+resource "time_sleep" "wait_for_join_reboot" {
+  create_duration = "90s"
 
   depends_on = [aws_ssm_association.join_domain]
 }
@@ -615,6 +739,14 @@ resource "aws_ssm_association" "agent_setup" {
 
   parameters = {
     TargetServers = join(",", [for name in local.dhcp_hosts : local.assigned_ips_by_host[name]])
+  }
+
+  dynamic "output_location" {
+    for_each = local.ssm_logs_enabled ? [1] : []
+    content {
+      s3_bucket_name = local.ssm_log_bucket
+      s3_key_prefix  = "${local.ssm_log_prefix}/agent-setup/${each.key}"
+    }
   }
 
   wait_for_success_timeout_seconds = 300

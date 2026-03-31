@@ -104,15 +104,17 @@ key_pair_pem_path  = "/path/to/your-key.pem"
 Terraform deploys VMs and configures them via SSM in this order:
 
 ```
-1. configure_networking  → Static IP, DNS, IMDS route, network profile
-2. rename_computer       → Rename from EC2AMAZ-xxx to configured name
+1. rename_computer       → Rename from EC2AMAZ-xxx to configured name (reboot)
+2. configure_networking  → Static IP, DNS, IMDS route, network profile
 3. install_features      → Role-specific Windows features (DHCP, DNS, AD tools)
-4. bootstrap_domain      → Create AD forest on bootstrap host
+4. bootstrap_domain      → Create AD forest on bootstrap host (reboot)
 5. dns_forwarder         → Add VPC DNS as forwarder on the DC
-6. join_domain           → Non-bootstrap hosts join the domain
+6. join_domain           → Non-bootstrap hosts join the domain (reboot)
 7. credential_setup      → Create service account, configure WinRM
 8. agent_setup           → Write DHCP target config on agent clients
 ```
+
+Automatic `time_sleep` resources are inserted after reboot-inducing steps (rename, bootstrap, join) to allow instances to come back online before the next phase starts.
 
 ## Make Targets
 
@@ -130,7 +132,7 @@ make apply             Terraform apply (provision everything)
 make destroy           Terraform destroy (tear down everything)
 make output            Show Terraform outputs
 make status            Quick host inventory status
-make progress          Show SSM association progress per phase
+make progress          Show SSM phase progress (status, attempts, retries)
 make creds             List all VM credential Vault paths
 make creds HOST=dhcp01 Show RDP credentials for a specific VM
 ```
@@ -178,11 +180,35 @@ export VAULT_TOKEN=dev-root
 
 To disable Vault entirely, set `vault.enabled: false` in your environment config.
 
+## SSM Output Logging
+
+SSM command output is truncated by default. To capture full logs in S3, add to your `config/environment.yml`:
+
+```yaml
+ssm_logs:
+  s3_bucket: your-existing-bucket
+  s3_prefix: ib-msad           # optional, defaults to "ssm-logs"
+```
+
+This writes full stdout/stderr from every SSM command to `s3://your-existing-bucket/ib-msad/<phase>/<host>/`. An IAM policy granting `s3:PutObject` is automatically attached to the instance role.
+
+To disable, remove the `ssm_logs` section or omit `s3_bucket`.
+
+Browse logs:
+
+```bash
+aws s3 ls s3://your-existing-bucket/ib-msad/ --recursive --profile your-aws-profile
+```
+
 ## Troubleshooting
 
 ### SSM agent not connecting
 
 Check that your security group allows outbound HTTPS (443) to AWS endpoints. The VMs need to reach `ssm.us-east-1.amazonaws.com`, `ec2messages.us-east-1.amazonaws.com`, and `ssmmessages.us-east-1.amazonaws.com`.
+
+### SSM association fails immediately after a reboot phase
+
+The provisioner inserts `time_sleep` pauses between reboot-inducing steps. If you still see failures, increase the sleep durations in `main.tf` (search for `time_sleep`). Common cause: CIM/WMI not ready yet after Windows reboot.
 
 ### DNS resolution fails after AD install
 

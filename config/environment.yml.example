@@ -43,6 +43,11 @@ vault:
   store_rdp_credentials: true
   rdp_credentials_path_prefix: msad/rdp
 
+# Optional. Omit or remove s3_bucket to disable SSM output logging.
+# ssm_logs:
+#   s3_bucket: your-bucket-name
+#   s3_prefix: ssm-logs
+
 hosts:
   - name: dhcp01
     role: dhcp_server
