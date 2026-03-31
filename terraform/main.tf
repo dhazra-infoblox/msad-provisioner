@@ -287,6 +287,7 @@ resource "aws_ssm_document" "configure_networking" {
       name   = "ConfigureStaticIp"
       inputs = {
         runCommand = [
+          "$ErrorActionPreference = 'Stop'",
           "# Wait for CIM/WMI to be ready after reboot",
           "$timeout = 180; $elapsed = 0; $adapter = $null",
           "while ($elapsed -lt $timeout) { try { $adapter = Get-NetAdapter -ErrorAction Stop | Where-Object { $_.Status -eq 'Up' } | Select-Object -First 1; if ($adapter) { break } } catch { Write-Host \"Waiting for CIM/NetAdapter... ($elapsed s)\" }; Start-Sleep -Seconds 10; $elapsed += 10 }",
@@ -365,6 +366,7 @@ resource "aws_ssm_document" "rename_computer" {
       name   = "RenameComputer"
       inputs = {
         runCommand = [
+          "$ErrorActionPreference = 'Stop'",
           "$current = $env:COMPUTERNAME",
           "if ($current -ne '{{ Hostname }}') { Rename-Computer -NewName '{{ Hostname }}' -Force -Restart } else { Write-Host 'Hostname already set' }"
         ]
@@ -415,6 +417,7 @@ resource "aws_ssm_document" "install_windows_features" {
       name   = "InstallFeatures"
       inputs = {
         runCommand = [
+          "$ErrorActionPreference = 'Stop'",
           "# Wait for CBS (component store) to be ready after a reboot",
           "$timeout = 600; $elapsed = 0",
           "while ($elapsed -lt $timeout) { $cbs = Get-Service -Name TrustedInstaller -ErrorAction SilentlyContinue; if ($cbs) { if ($cbs.Status -ne 'Running') { Start-Service TrustedInstaller -ErrorAction SilentlyContinue }; if ($cbs.Status -eq 'Running') { break } }; Start-Sleep -Seconds 10; $elapsed += 10; Write-Host \"Waiting for TrustedInstaller... ($elapsed s)\" }",
@@ -468,12 +471,18 @@ resource "aws_ssm_document" "bootstrap_domain" {
       DomainFqdn     = { type = "String" }
       DomainNetbios  = { type = "String" }
       SafeModePass   = { type = "String" }
+      AdminPass      = { type = "String" }
     }
     mainSteps = [{
       action = "aws:runPowerShellScript"
       name   = "BootstrapForest"
       inputs = {
         runCommand = [
+          "$ErrorActionPreference = 'Stop'",
+          "# Idempotency: skip if forest already exists",
+          "try { $forest = Get-ADForest -ErrorAction Stop; Write-Host \"Forest '$($forest.Name)' already exists, skipping\"; exit 0 } catch { Write-Host 'No existing forest, proceeding with bootstrap' }",
+          "# Set local Administrator password to the known domain admin password before promotion",
+          "net user Administrator '{{ AdminPass }}'",
           "Install-WindowsFeature -Name AD-Domain-Services -IncludeManagementTools",
           "$pwd = ConvertTo-SecureString '{{ SafeModePass }}' -AsPlainText -Force",
           "Install-ADDSForest -DomainName '{{ DomainFqdn }}' -DomainNetbiosName '{{ DomainNetbios }}' -SafeModeAdministratorPassword $pwd -Force:$true -NoRebootOnCompletion:$false"
@@ -495,13 +504,14 @@ resource "aws_ssm_association" "bootstrap_domain" {
     DomainFqdn    = local.domain.fqdn
     DomainNetbios = local.domain.netbios
     SafeModePass  = local.safe_mode_password
+    AdminPass     = local.domain_admin_password
   }
 
   dynamic "output_location" {
     for_each = local.ssm_logs_enabled ? [1] : []
     content {
       s3_bucket_name = local.ssm_log_bucket
-      s3_key_prefix  = "${local.ssm_log_prefix}/bootstrap-domain"
+      s3_key_prefix  = "${local.ssm_log_prefix}/bootstrap-domain/${local.bootstrap_host}"
     }
   }
 
@@ -531,6 +541,7 @@ resource "aws_ssm_document" "configure_dns_forwarder" {
       name   = "AddDnsForwarder"
       inputs = {
         runCommand = [
+          "$ErrorActionPreference = 'Stop'",
           "$existing = Get-DnsServerForwarder -ErrorAction SilentlyContinue | Select-Object -ExpandProperty IPAddress | ForEach-Object { $_.IPAddressToString }",
           "if ('{{ VpcDns }}' -notin $existing) { Add-DnsServerForwarder -IPAddress '{{ VpcDns }}' -PassThru }"
         ]
@@ -555,7 +566,7 @@ resource "aws_ssm_association" "configure_dns_forwarder" {
     for_each = local.ssm_logs_enabled ? [1] : []
     content {
       s3_bucket_name = local.ssm_log_bucket
-      s3_key_prefix  = "${local.ssm_log_prefix}/dns-forwarder"
+      s3_key_prefix  = "${local.ssm_log_prefix}/dns-forwarder/${local.bootstrap_host}"
     }
   }
 
@@ -565,7 +576,9 @@ resource "aws_ssm_association" "configure_dns_forwarder" {
 }
 
 resource "time_sleep" "wait_for_bootstrap_reboot" {
-  create_duration = "120s"
+  # DC needs time after forest promotion reboot to start AD DS, register SRV
+  # records with DNS, and initialise Netlogon/KDC services.
+  create_duration = "180s"
 
   depends_on = [aws_ssm_association.bootstrap_domain]
 }
@@ -588,9 +601,56 @@ resource "aws_ssm_document" "join_domain" {
       name   = "JoinDomain"
       inputs = {
         runCommand = [
+          "$ErrorActionPreference = 'Stop'",
+          "",
+          "# Idempotency: skip if already domain-joined",
+          "$cs = Get-WmiObject Win32_ComputerSystem",
+          "if ($cs.PartOfDomain -and $cs.Domain -eq '{{ DomainFqdn }}') {",
+          "    Write-Host 'Already joined to {{ DomainFqdn }}, skipping'",
+          "    exit 0",
+          "}",
+          "",
+          "# Clear negative DNS cache from any earlier failed lookups",
+          "Clear-DnsClientCache -ErrorAction SilentlyContinue",
+          "",
+          "# Wait for DC SRV records (Add-Computer uses DsGetDcName which requires these)",
+          "$srvName = '_ldap._tcp.dc._msdcs.{{ DomainFqdn }}'",
+          "$timeout = 600; $elapsed = 0",
+          "while ($elapsed -lt $timeout) {",
+          "    try {",
+          "        $srv = Resolve-DnsName $srvName -Type SRV -ErrorAction Stop",
+          "        Write-Host \"DC SRV record found: $($srv[0].NameTarget)\"",
+          "        break",
+          "    } catch {",
+          "        Write-Host \"Waiting for DC SRV record ($srvName)... ($elapsed s)\"",
+          "        Start-Sleep 15",
+          "        $elapsed += 15",
+          "        Clear-DnsClientCache -ErrorAction SilentlyContinue",
+          "    }",
+          "}",
+          "if ($elapsed -ge $timeout) { throw \"DC SRV record $srvName not found after $${timeout}s\" }",
+          "",
+          "# Build credential",
           "$sec = ConvertTo-SecureString '{{ AdminPass }}' -AsPlainText -Force",
           "$cred = New-Object System.Management.Automation.PSCredential('{{ AdminUser }}', $sec)",
-          "Add-Computer -DomainName '{{ DomainFqdn }}' -Credential $cred -Force -Restart"
+          "",
+          "# Attempt domain join with retries (DC may need extra time for Netlogon/KDC)",
+          "$maxRetries = 8; $attempt = 0",
+          "while ($attempt -lt $maxRetries) {",
+          "    $attempt++",
+          "    try {",
+          "        Write-Host \"Domain join attempt $attempt of $maxRetries\"",
+          "        Add-Computer -DomainName '{{ DomainFqdn }}' -Credential $cred -Force -Restart",
+          "        Write-Host 'Domain join succeeded, restarting'",
+          "        exit 0",
+          "    } catch {",
+          "        Write-Host \"Attempt $attempt failed: $_\"",
+          "        if ($attempt -ge $maxRetries) { throw \"Domain join failed after $maxRetries attempts: $_\" }",
+          "        Write-Host 'Sleeping 30s before retry...'",
+          "        Start-Sleep 30",
+          "        Clear-DnsClientCache -ErrorAction SilentlyContinue",
+          "    }",
+          "}"
         ]
       }
     }]
@@ -623,8 +683,8 @@ resource "aws_ssm_association" "join_domain" {
     }
   }
 
-  # Domain join triggers a reboot; allow enough time for reboot + re-registration.
-  wait_for_success_timeout_seconds = 600
+  # DNS wait (600s) + LDAP wait (300s) + join retries (150s) + reboot
+  wait_for_success_timeout_seconds = 1200
 
   depends_on = [aws_ssm_association.configure_dns_forwarder]
 }
@@ -648,17 +708,24 @@ resource "aws_ssm_document" "credential_setup" {
       name   = "ConfigureCredentials"
       inputs = {
         runCommand = [
+          "$ErrorActionPreference = 'Stop'",
           "$username = '{{ Username }}'",
           "$upn = \"$username@{{ DomainFqdn }}\"",
           "$password = ConvertTo-SecureString '{{ Password }}' -AsPlainText -Force",
-          "if (-not (Get-ADUser -Filter \"UserPrincipalName -eq '$upn'\" -ErrorAction SilentlyContinue)) { New-ADUser -Name $username -SamAccountName $username -UserPrincipalName $upn -AccountPassword $password -Enabled $true }",
-          "Add-ADGroupMember -Identity 'Domain Users' -Members $username -ErrorAction SilentlyContinue",
-          "Add-ADGroupMember -Identity 'Remote Management Users' -Members $username -ErrorAction SilentlyContinue",
-          "Add-ADGroupMember -Identity 'DNSAdmins' -Members $username -ErrorAction SilentlyContinue",
-          "Add-ADGroupMember -Identity 'DHCP Administrators' -Members $username -ErrorAction SilentlyContinue",
+          "if (-not (Get-ADUser -Filter \"UserPrincipalName -eq '$upn'\" -ErrorAction SilentlyContinue)) { New-ADUser -Name $username -SamAccountName $username -UserPrincipalName $upn -AccountPassword $password -Enabled $true; Write-Host \"Created user $upn\" } else { Write-Host \"User $upn already exists\" }",
+          "foreach ($grp in @('Domain Users','Remote Management Users','DNSAdmins','DHCP Administrators')) { try { Add-ADGroupMember -Identity $grp -Members $username -ErrorAction Stop; Write-Host \"Added to $grp\" } catch { if ($_.Exception.Message -match 'already a member') { Write-Host \"Already in $grp\" } elseif ($_.Exception.Message -match 'Cannot find an object with identity') { Write-Host \"Group $grp not found, skipping\" } else { throw } } }",
           "Enable-WSManCredSSP -Role Server -Force",
           "Set-NetFirewallRule -Name 'WINRM-HTTP-In-TCP-PUBLIC' -RemoteAddress Any",
-          "Set-Item WSMan:\\localhost\\Client\\TrustedHosts -Value '{{ TrustedHosts }}' -Force"
+          "Set-Item WSMan:\\localhost\\Client\\TrustedHosts -Value '{{ TrustedHosts }}' -Force",
+          "$u = Get-ADUser -Identity $username -Properties MemberOf,UserPrincipalName,Enabled,WhenCreated",
+          "Write-Host '--- User Details ---'",
+          "Write-Host \"  SAM Account : $($u.SamAccountName)\"",
+          "Write-Host \"  UPN         : $($u.UserPrincipalName)\"",
+          "Write-Host \"  Domain Logon: $${env:USERDOMAIN}\\$($u.SamAccountName)\"",
+          "Write-Host \"  Enabled     : $($u.Enabled)\"",
+          "Write-Host \"  Created     : $($u.WhenCreated)\"",
+          "Write-Host \"  Groups      : $(($u.MemberOf | ForEach-Object { ($_ -split ',')[0] -replace 'CN=' }) -join ', ')\"",
+          "Write-Host 'Credential setup complete'"
         ]
       }
     }]
@@ -684,7 +751,7 @@ resource "aws_ssm_association" "credential_setup" {
     for_each = local.ssm_logs_enabled ? [1] : []
     content {
       s3_bucket_name = local.ssm_log_bucket
-      s3_key_prefix  = "${local.ssm_log_prefix}/credential-setup"
+      s3_key_prefix  = "${local.ssm_log_prefix}/credential-setup/${local.bootstrap_host}"
     }
   }
 
@@ -714,8 +781,7 @@ resource "aws_ssm_document" "agent_setup" {
       action = "aws:runPowerShellScript"
       name   = "WriteAgentTargets"
       inputs = {
-        runCommand = [
-          "$path = 'C:\\ProgramData\\msad-agent'",
+        runCommand = [          "$ErrorActionPreference = 'Stop'",          "$path = 'C:\\ProgramData\\msad-agent'",
           "New-Item -Path $path -ItemType Directory -Force | Out-Null",
           "$targets = '{{ TargetServers }}'.Split(',')",
           "$targets | ConvertTo-Json | Set-Content -Path \"$path\\dhcp-targets.json\""

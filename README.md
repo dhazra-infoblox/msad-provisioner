@@ -133,6 +133,9 @@ make destroy           Terraform destroy (tear down everything)
 make output            Show Terraform outputs
 make status            Quick host inventory status
 make progress          Show SSM phase progress (status, attempts, retries)
+make logs              List SSM log phases stored in S3
+make logs PHASE=x      List hosts with logs for a phase
+make logs PHASE=x HOST=y  Show latest stdout/stderr for phase/host
 make creds             List all VM credential Vault paths
 make creds HOST=dhcp01 Show RDP credentials for a specific VM
 ```
@@ -197,7 +200,9 @@ To disable, remove the `ssm_logs` section or omit `s3_bucket`.
 Browse logs:
 
 ```bash
-aws s3 ls s3://your-existing-bucket/ib-msad/ --recursive --profile your-aws-profile
+make logs                              # list phases with log counts
+make logs PHASE=join-domain            # list hosts for a phase
+make logs PHASE=join-domain HOST=dhcp02  # show latest stdout+stderr
 ```
 
 ## Troubleshooting

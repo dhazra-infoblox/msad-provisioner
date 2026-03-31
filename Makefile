@@ -2,7 +2,7 @@ CONFIG  ?= config/environment.yml
 TF_DIR  ?= terraform
 TF_VARS ?= -var="config_file=../$(CONFIG)" -var-file="secret.tfvars"
 
-.PHONY: help login vault-start vault-stop vault-status vault-setup init validate plan apply destroy output status progress creds
+.PHONY: help login vault-start vault-stop vault-status vault-setup init validate plan apply destroy output status progress logs creds
 
 help:
 	@echo "Targets:"
@@ -21,6 +21,9 @@ help:
 	@echo "  make output          - terraform output"
 	@echo "  make status          - quick host inventory status"
 	@echo "  make progress        - phase progress from SSM associations"
+	@echo "  make logs            - list SSM log phases in S3"
+	@echo "  make logs PHASE=x    - list hosts with logs for a phase"
+	@echo "  make logs PHASE=x HOST=y - show latest logs for phase/host"
 	@echo "  make creds           - list all VM credential Vault paths"
 	@echo "  make creds HOST=name - show credentials for a specific VM"
 
@@ -74,6 +77,14 @@ status:
 
 progress:
 	./scripts/progress.sh
+
+# Show SSM command output logs stored in S3.
+# Usage: make logs                       → list phases with logs
+#        make logs PHASE=join-domain      → list hosts for that phase
+#        make logs PHASE=join-domain HOST=dhcp02 → show latest stdout/stderr
+PHASE ?=
+logs:
+	@./scripts/ssm_logs.sh $(PHASE) $(HOST)
 
 # Read VM credentials from Vault.
 # Usage: make creds            → list all stored paths
