@@ -41,13 +41,15 @@ PHASES=(
 # ── Args ──────────────────────────────────────────────────────────────────────
 PHASE="${1:-}"
 HOST="${2:-}"
+RUN="${3:-}"
 
 usage() {
-  echo "Usage: $0 [PHASE] [HOST]"
+  echo "Usage: $0 [PHASE] [HOST] [RUN]"
   echo ""
-  echo "  $0                  - list all phases that have logs"
-  echo "  $0 PHASE            - list hosts with logs for a phase"
-  echo "  $0 PHASE HOST       - show latest stdout+stderr for phase/host"
+  echo "  $0                     - list all phases that have logs"
+  echo "  $0 PHASE               - list hosts with logs for a phase"
+  echo "  $0 PHASE HOST          - list all runs with timestamps, show latest"
+  echo "  $0 PHASE HOST N        - show run N (1=oldest, use 'all' to list only)"
   echo ""
   echo "Phases: ${PHASES[*]}"
   exit 0
@@ -76,28 +78,82 @@ if [[ -z "$HOST" ]]; then
   echo "Hosts with logs for phase: $PHASE"
   echo ""
   aws s3 ls "${S3_BASE}/${PHASE}/" "${AWS_OPTS[@]}" 2>/dev/null \
-    | awk '{print $NF}' | sed 's:/$::' | sort
+    | awk '{print $NF}' | sed 's:/$::' \
+    | grep -v '^[0-9a-f]\{8\}-[0-9a-f]\{4\}-' \
+    | sort
   exit 0
 fi
 
-# ── Phase + Host: show latest stdout/stderr ──────────────────────────────────
+# ── Phase + Host: show runs with timestamps ──────────────────────────────────
 LOG_PATH="${S3_BASE}/${PHASE}/${HOST}"
 
-# Find the latest command invocation (sorted by timestamp)
-LATEST_DIR=$(aws s3 ls "${LOG_PATH}/" "${AWS_OPTS[@]}" --recursive 2>/dev/null \
-  | sort -k1,2 | tail -1 | awk '{print $NF}')
+# Collect all command invocation dirs (each command-id is a separate run)
+ALL_FILES=$(aws s3 ls "${LOG_PATH}/" "${AWS_OPTS[@]}" --recursive 2>/dev/null \
+  | sort -k1,2)
 
-if [[ -z "$LATEST_DIR" ]]; then
+if [[ -z "$ALL_FILES" ]]; then
   echo "No logs found at ${LOG_PATH}/"
   exit 1
 fi
 
-# Extract the invocation prefix (everything up to the step name dir)
-# e.g. ib-msad/ssm_logs/join-domain/dhcp02/<cmd-id>/<instance-id>/<plugin>/<step>/stdout
-INVOCATION_PREFIX=$(echo "$LATEST_DIR" | sed 's|/[^/]*$||')
+# Extract unique invocation prefixes (up to the step dir) with their timestamps
+# Each line: <date> <time> <size> <path>
+# Group by command-id to get unique runs
+declare -a RUN_PREFIXES=()
+declare -a RUN_TIMESTAMPS=()
+PREV_CMD_ID=""
 
-echo "=== Latest logs for ${PHASE}/${HOST} ==="
-echo "    ${S3_BASE%%${S3_PREFIX}*}${INVOCATION_PREFIX}/"
+while IFS= read -r line; do
+  filepath=$(echo "$line" | awk '{print $NF}')
+  timestamp=$(echo "$line" | awk '{print $1 " " $2}')
+  # Extract command-id: .../phase/host/<cmd-id>/...
+  # The path after host/ starts with the command-id
+  after_host="${filepath#${S3_PREFIX}/${PHASE}/${HOST}/}"
+  cmd_id="${after_host%%/*}"
+  if [[ "$cmd_id" != "$PREV_CMD_ID" ]]; then
+    prefix=$(echo "$filepath" | sed 's|/[^/]*$||')
+    RUN_PREFIXES+=("$prefix")
+    RUN_TIMESTAMPS+=("$timestamp")
+    PREV_CMD_ID="$cmd_id"
+  fi
+done <<< "$ALL_FILES"
+
+TOTAL_RUNS=${#RUN_PREFIXES[@]}
+
+# If RUN=all, just list runs and exit
+if [[ "$RUN" == "all" ]]; then
+  echo "Runs for ${PHASE}/${HOST}: ($TOTAL_RUNS total)"
+  echo ""
+  printf "  %-5s %-20s %s\n" "RUN" "TIMESTAMP" "COMMAND_ID"
+  printf "  %-5s %-20s %s\n" "───" "─────────" "──────────"
+  for i in "${!RUN_PREFIXES[@]}"; do
+    after_host="${RUN_PREFIXES[$i]#${S3_PREFIX}/${PHASE}/${HOST}/}"
+    cmd_id="${after_host%%/*}"
+    printf "  %-5s %-20s %s\n" "$((i+1))" "${RUN_TIMESTAMPS[$i]}" "$cmd_id"
+  done
+  exit 0
+fi
+
+# Determine which run to show
+if [[ -n "$RUN" && "$RUN" =~ ^[0-9]+$ ]]; then
+  RUN_IDX=$((RUN - 1))
+  if [[ $RUN_IDX -lt 0 || $RUN_IDX -ge $TOTAL_RUNS ]]; then
+    echo "Run $RUN out of range (1-$TOTAL_RUNS)" >&2
+    exit 1
+  fi
+else
+  RUN_IDX=$((TOTAL_RUNS - 1))  # latest
+fi
+
+INVOCATION_PREFIX="${RUN_PREFIXES[$RUN_IDX]}"
+RUN_TS="${RUN_TIMESTAMPS[$RUN_IDX]}"
+RUN_NUM=$((RUN_IDX + 1))
+
+# Print run index header
+echo "=== ${PHASE}/${HOST} — run ${RUN_NUM}/${TOTAL_RUNS} @ ${RUN_TS} ==="
+after_host="${INVOCATION_PREFIX#${S3_PREFIX}/${PHASE}/${HOST}/}"
+cmd_id="${after_host%%/*}"
+echo "    cmd: ${cmd_id}"
 echo ""
 
 for stream in stdout stderr; do

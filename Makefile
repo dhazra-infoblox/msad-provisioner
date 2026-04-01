@@ -2,7 +2,7 @@ CONFIG  ?= config/environment.yml
 TF_DIR  ?= terraform
 TF_VARS ?= -var="config_file=../$(CONFIG)" -var-file="secret.tfvars"
 
-.PHONY: help login vault-start vault-stop vault-status vault-setup init validate plan apply destroy output status progress logs creds
+.PHONY: help login vault-start vault-stop vault-status vault-setup init validate plan apply destroy redeploy output status progress logs creds
 
 help:
 	@echo "Targets:"
@@ -18,12 +18,15 @@ help:
 	@echo "  make plan            - terraform plan"
 	@echo "  make apply           - terraform apply"
 	@echo "  make destroy         - terraform destroy"
+	@echo "  make redeploy        - destroy and apply (clean deploy)"
 	@echo "  make output          - terraform output"
 	@echo "  make status          - quick host inventory status"
 	@echo "  make progress        - phase progress from SSM associations"
 	@echo "  make logs            - list SSM log phases in S3"
 	@echo "  make logs PHASE=x    - list hosts with logs for a phase"
-	@echo "  make logs PHASE=x HOST=y - show latest logs for phase/host"
+	@echo "  make logs PHASE=x HOST=y         - show latest run"
+	@echo "  make logs PHASE=x HOST=y RUN=all - list all runs"
+	@echo "  make logs PHASE=x HOST=y RUN=N   - show run N"
 	@echo "  make creds           - list all VM credential Vault paths"
 	@echo "  make creds HOST=name - show credentials for a specific VM"
 
@@ -69,6 +72,8 @@ apply:
 destroy:
 	terraform -chdir=$(TF_DIR) destroy $(TF_VARS) --auto-approve
 
+redeploy: destroy apply
+
 output:
 	terraform -chdir=$(TF_DIR) output
 
@@ -82,9 +87,12 @@ progress:
 # Usage: make logs                       → list phases with logs
 #        make logs PHASE=join-domain      → list hosts for that phase
 #        make logs PHASE=join-domain HOST=dhcp02 → show latest stdout/stderr
+#        make logs PHASE=join-domain HOST=dhcp02 RUN=all → list all runs
+#        make logs PHASE=join-domain HOST=dhcp02 RUN=1   → show specific run
 PHASE ?=
+RUN   ?=
 logs:
-	@./scripts/ssm_logs.sh $(PHASE) $(HOST)
+	@./scripts/ssm_logs.sh $(PHASE) $(HOST) $(RUN)
 
 # Read VM credentials from Vault.
 # Usage: make creds            → list all stored paths

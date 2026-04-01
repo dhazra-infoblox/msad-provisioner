@@ -295,7 +295,7 @@ resource "aws_ssm_document" "configure_networking" {
           "$ifIndex = $adapter.IfIndex",
           "Set-NetIPInterface -InterfaceIndex $ifIndex -AddressFamily IPv4 -Dhcp Disabled -ErrorAction SilentlyContinue",
           "$existingTarget = Get-NetIPAddress -InterfaceIndex $ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -eq '{{ StaticIp }}' }",
-          "if (-not $existingTarget) { New-NetIPAddress -InterfaceIndex $ifIndex -IPAddress '{{ StaticIp }}' -PrefixLength {{ PrefixLength }} -DefaultGateway '{{ Gateway }}' -AddressFamily IPv4 -ErrorAction Stop }",
+          "if (-not $existingTarget) { New-NetIPAddress -InterfaceIndex $ifIndex -IPAddress '{{ StaticIp }}' -PrefixLength {{ PrefixLength }} -DefaultGateway '{{ Gateway }}' -AddressFamily IPv4 -ErrorAction Stop | Out-Null; Write-Host \"Set static IP {{ StaticIp }}/{{ PrefixLength }} gw {{ Gateway }}\" } else { Write-Host 'Static IP already configured' }",
           "$oldDhcp = Get-NetIPAddress -InterfaceIndex $ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -ne '{{ StaticIp }}' -and $_.PrefixOrigin -eq 'Dhcp' }",
           "if ($oldDhcp) { $oldDhcp | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue }",
           "$dns = '{{ DnsList }}'.Split(',')",
@@ -335,7 +335,7 @@ resource "aws_ssm_association" "configure_networking" {
 
   # Rename (with reboot) runs first while DHCP is active; then we set static
   # networking so no subsequent reboot can reset DNS settings.
-  wait_for_success_timeout_seconds = 300
+  wait_for_success_timeout_seconds = 600
 
   depends_on = [time_sleep.wait_for_rename_reboot]
 }
@@ -702,6 +702,7 @@ resource "aws_ssm_document" "credential_setup" {
       Password     = { type = "String" }
       DomainFqdn   = { type = "String" }
       TrustedHosts = { type = "String" }
+      IsBootstrap  = { type = "String", default = "false" }
     }
     mainSteps = [{
       action = "aws:runPowerShellScript"
@@ -712,20 +713,46 @@ resource "aws_ssm_document" "credential_setup" {
           "$username = '{{ Username }}'",
           "$upn = \"$username@{{ DomainFqdn }}\"",
           "$password = ConvertTo-SecureString '{{ Password }}' -AsPlainText -Force",
-          "if (-not (Get-ADUser -Filter \"UserPrincipalName -eq '$upn'\" -ErrorAction SilentlyContinue)) { New-ADUser -Name $username -SamAccountName $username -UserPrincipalName $upn -AccountPassword $password -Enabled $true; Write-Host \"Created user $upn\" } else { Write-Host \"User $upn already exists\" }",
-          "foreach ($grp in @('Domain Users','Remote Management Users','DNSAdmins','DHCP Administrators')) { try { Add-ADGroupMember -Identity $grp -Members $username -ErrorAction Stop; Write-Host \"Added to $grp\" } catch { if ($_.Exception.Message -match 'already a member') { Write-Host \"Already in $grp\" } elseif ($_.Exception.Message -match 'Cannot find an object with identity') { Write-Host \"Group $grp not found, skipping\" } else { throw } } }",
+          "$isBootstrap = '{{ IsBootstrap }}' -eq 'true'",
+          "",
+          "# AD user creation — only on the DC (bootstrap host)",
+          "if ($isBootstrap) {",
+          "  if (-not (Get-ADUser -Filter \"UserPrincipalName -eq '$upn'\" -ErrorAction SilentlyContinue)) { New-ADUser -Name $username -SamAccountName $username -UserPrincipalName $upn -AccountPassword $password -Enabled $true; Write-Host \"Created user $upn\" } else { Write-Host \"User $upn already exists\" }",
+          "  foreach ($grp in @('Domain Users','Remote Management Users','DNSAdmins','DHCP Administrators')) { try { Add-ADGroupMember -Identity $grp -Members $username -ErrorAction Stop; Write-Host \"Added to $grp\" } catch { if ($_.Exception.Message -match 'already a member') { Write-Host \"Already in $grp\" } elseif ($_.Exception.Message -match 'Cannot find an object with identity') { Write-Host \"Group $grp not found, skipping\" } else { throw } } }",
+          "} else { Write-Host \"Non-DC host, skipping AD user creation\" }",
+          "",
+          "# CredSSP, firewall, TrustedHosts — all DHCP servers",
           "Enable-WSManCredSSP -Role Server -Force",
           "Set-NetFirewallRule -Name 'WINRM-HTTP-In-TCP-PUBLIC' -RemoteAddress Any",
           "Set-Item WSMan:\\localhost\\Client\\TrustedHosts -Value '{{ TrustedHosts }}' -Force",
-          "$u = Get-ADUser -Identity $username -Properties MemberOf,UserPrincipalName,Enabled,WhenCreated",
-          "Write-Host '--- User Details ---'",
-          "Write-Host \"  SAM Account : $($u.SamAccountName)\"",
-          "Write-Host \"  UPN         : $($u.UserPrincipalName)\"",
-          "Write-Host \"  Domain Logon: $${env:USERDOMAIN}\\$($u.SamAccountName)\"",
-          "Write-Host \"  Enabled     : $($u.Enabled)\"",
-          "Write-Host \"  Created     : $($u.WhenCreated)\"",
-          "Write-Host \"  Groups      : $(($u.MemberOf | ForEach-Object { ($_ -split ',')[0] -replace 'CN=' }) -join ', ')\"",
-          "Write-Host 'Credential setup complete'"
+          "# Grant WMI permissions (Remote Enable + Execute Methods) on DNS and DHCP namespaces",
+          "function Set-WmiNamespaceSecurity($ns, $account) {",
+          "  $sec = ([wmiclass]\"\\\\localhost\\$($ns):__SystemSecurity\")",
+          "  $sd = $sec.GetSecurityDescriptor().Descriptor",
+          "  $sid = (New-Object System.Security.Principal.NTAccount($account)).Translate([System.Security.Principal.SecurityIdentifier])",
+          "  $ace = ([wmiclass]'Win32_ACE').CreateInstance()",
+          "  $trustee = ([wmiclass]'Win32_Trustee').CreateInstance()",
+          "  $trustee.SIDString = $sid.Value",
+          "  $ace.AccessMask = 0x21",
+          "  $ace.AceType = 0",
+          "  $ace.AceFlags = 0",
+          "  $ace.Trustee = $trustee",
+          "  $sd.DACL += $ace",
+          "  $sec.SetSecurityDescriptor($sd) | Out-Null",
+          "}",
+          "foreach ($ns in @('Root/Microsoft/Windows/DNS')) { Set-WmiNamespaceSecurity $ns $username; Set-WmiNamespaceSecurity $ns 'DNSAdmins'; Write-Host \"WMI: $username + DNSAdmins granted on $ns\" }",
+          "try { foreach ($acct in @($username, 'DNSAdmins')) { Set-WmiNamespaceSecurity 'Root/Microsoft/Windows/DHCP' $acct }; Write-Host \"WMI: $username + DNSAdmins granted on Root/Microsoft/Windows/DHCP\" } catch { Write-Host \"DHCP WMI namespace not available, skipping: $($_.Exception.Message)\" }",
+          "if ($isBootstrap) {",
+          "  $u = Get-ADUser -Identity $username -Properties MemberOf,UserPrincipalName,Enabled,WhenCreated",
+          "  Write-Host '--- User Details ---'",
+          "  Write-Host \"  SAM Account : $($u.SamAccountName)\"",
+          "  Write-Host \"  UPN         : $($u.UserPrincipalName)\"",
+          "  Write-Host \"  Domain Logon: $${env:USERDOMAIN}\\$($u.SamAccountName)\"",
+          "  Write-Host \"  Enabled     : $($u.Enabled)\"",
+          "  Write-Host \"  Created     : $($u.WhenCreated)\"",
+          "  Write-Host \"  Groups      : $(($u.MemberOf | ForEach-Object { ($_ -split ',')[0] -replace 'CN=' }) -join ', ')\"",
+          "}",
+          "Write-Host \"Credential setup complete on $(hostname)\"",
         ]
       }
     }]
@@ -733,11 +760,15 @@ resource "aws_ssm_document" "credential_setup" {
 }
 
 resource "aws_ssm_association" "credential_setup" {
+  for_each = {
+    for name, vm in aws_instance.nodes : name => vm if local.host_map[name].role == "dhcp_server" || name == local.bootstrap_host
+  }
+
   name = aws_ssm_document.credential_setup.name
 
   targets {
     key    = "InstanceIds"
-    values = [aws_instance.nodes[local.bootstrap_host].id]
+    values = [each.value.id]
   }
 
   parameters = {
@@ -745,13 +776,14 @@ resource "aws_ssm_association" "credential_setup" {
     Password     = local.service_user_password
     DomainFqdn   = local.domain.fqdn
     TrustedHosts = join(",", [for name in local.dhcp_hosts : local.assigned_ips_by_host[name]])
+    IsBootstrap  = each.key == local.bootstrap_host ? "true" : "false"
   }
 
   dynamic "output_location" {
     for_each = local.ssm_logs_enabled ? [1] : []
     content {
       s3_bucket_name = local.ssm_log_bucket
-      s3_key_prefix  = "${local.ssm_log_prefix}/credential-setup/${local.bootstrap_host}"
+      s3_key_prefix  = "${local.ssm_log_prefix}/credential-setup/${each.key}"
     }
   }
 
@@ -773,18 +805,67 @@ resource "aws_ssm_document" "agent_setup" {
 
   content = jsonencode({
     schemaVersion = "2.2"
-    description   = "Configure agent target DHCP servers"
+    description   = "Configure agent client: CredSSP, GPO delegation, RSAT, targets"
     parameters = {
       TargetServers = { type = "String" }
+      DcIps         = { type = "String" }
+      Username      = { type = "String" }
+      Password      = { type = "String" }
+      DomainFqdn    = { type = "String" }
     }
     mainSteps = [{
       action = "aws:runPowerShellScript"
-      name   = "WriteAgentTargets"
+      name   = "ConfigureAgentClient"
       inputs = {
-        runCommand = [          "$ErrorActionPreference = 'Stop'",          "$path = 'C:\\ProgramData\\msad-agent'",
+        runCommand = [
+          "$ErrorActionPreference = 'Stop'",
+          "",
+          "# --- CredSSP Client ---",
+          "$dcIps = '{{ DcIps }}'.Split(',')",
+          "foreach ($ip in $dcIps) { Enable-WSManCredSSP -Role Client -DelegateComputer $ip -Force }",
+          "Write-Host \"CredSSP client enabled for: $($dcIps -join ', ')\"",
+          "",
+          "# --- TrustedHosts ---",
+          "Set-Item WSMan:\\localhost\\Client\\TrustedHosts -Value ('{{ DcIps }}' -replace ',', ',') -Force",
+          "Write-Host \"TrustedHosts set to: {{ DcIps }}\"",
+          "",
+          "# --- Install PolicyFileEditor to write Registry.pol properly ---",
+          "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12",
+          "Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null",
+          "Install-Module -Name PolicyFileEditor -Force | Out-Null",
+          "Import-Module PolicyFileEditor",
+          "Write-Host 'PolicyFileEditor module installed'",
+          "",
+          "# --- GPO: Allow delegating fresh credentials (Kerberos + NTLM-only) via Registry.pol ---",
+          "$polPath = \"$env:SystemRoot\\System32\\GroupPolicy\\Machine\\Registry.pol\"",
+          "$regPath = 'SOFTWARE\\Policies\\Microsoft\\Windows\\CredentialsDelegation'",
+          "# Enable AllowFreshCredentialsWhenNTLMOnly",
+          "Set-PolicyFileEntry -Path $polPath -Key $regPath -ValueName 'AllowFreshCredentialsWhenNTLMOnly' -Data 1 -Type DWord",
+          "Set-PolicyFileEntry -Path $polPath -Key $regPath -ValueName 'ConcatenateDefaults_AllowFreshNTLMOnly' -Data 1 -Type DWord",
+          "$i = 1",
+          "foreach ($ip in $dcIps) { Set-PolicyFileEntry -Path $polPath -Key \"$regPath\\AllowFreshCredentialsWhenNTLMOnly\" -ValueName \"$i\" -Data \"WSMAN/$ip\" -Type String; $i++ }",
+          "Write-Host \"GPO Registry.pol: AllowFreshCredentialsWhenNTLMOnly set for: $($dcIps | ForEach-Object { \"WSMAN/$_\" })\"",
+          "",
+          "# --- Apply group policy ---",
+          "gpupdate /force",
+          "Write-Host 'Group policy updated'",
+          "",
+          "# --- Write agent target list ---",
+          "$path = 'C:\\ProgramData\\msad-agent'",
           "New-Item -Path $path -ItemType Directory -Force | Out-Null",
           "$targets = '{{ TargetServers }}'.Split(',')",
-          "$targets | ConvertTo-Json | Set-Content -Path \"$path\\dhcp-targets.json\""
+          "$targets | ConvertTo-Json | Set-Content -Path \"$path\\dhcp-targets.json\"",
+          "Write-Host \"Agent targets written to $path\\dhcp-targets.json\"",
+          "",
+          "# --- Verify CredSSP with Invoke-Command ---",
+          "$secPass = ConvertTo-SecureString '{{ Password }}' -AsPlainText -Force",
+          "$cred = New-Object System.Management.Automation.PSCredential('{{ Username }}@{{ DomainFqdn }}', $secPass)",
+          "$dcIp = ($dcIps | Select-Object -First 1)",
+          "Write-Host \"Testing Invoke-Command to $dcIp as {{ Username }}@{{ DomainFqdn }}...\"",
+          "$result = Invoke-Command -ComputerName $dcIp -Credential $cred -Authentication Credssp -ScriptBlock { \"CredSSP OK from $env:COMPUTERNAME as $(whoami) on $(hostname)\" } -ErrorAction Stop",
+          "Write-Host $result",
+          "Write-Host '--- CredSSP Verification Passed ---'",
+          "Write-Host 'Agent setup complete'"
         ]
       }
     }]
@@ -805,6 +886,10 @@ resource "aws_ssm_association" "agent_setup" {
 
   parameters = {
     TargetServers = join(",", [for name in local.dhcp_hosts : local.assigned_ips_by_host[name]])
+    DcIps         = local.assigned_ips_by_host[local.bootstrap_host]
+    Username      = local.credentials.service_user
+    Password      = local.service_user_password
+    DomainFqdn    = local.domain.fqdn
   }
 
   dynamic "output_location" {
@@ -827,8 +912,8 @@ resource "vault_kv_secret_v2" "rdp_credentials" {
   name  = "${trimspace(local.rdp_vault_prefix)}/${each.key}"
 
   data_json = jsonencode({
-    username    = "Administrator"
-    password    = rsadecrypt(each.value.password_data, file(local.rdp_key_path))
+    username    = "CORP\\Administrator"
+    password    = local.domain_admin_password
     instance_id = each.value.id
     private_ip  = each.value.private_ip
     host        = each.key
