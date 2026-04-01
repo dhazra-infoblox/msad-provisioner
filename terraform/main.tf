@@ -717,6 +717,13 @@ resource "aws_ssm_document" "credential_setup" {
           "",
           "# AD user creation — only on the DC (bootstrap host)",
           "if ($isBootstrap) {",
+          "  # Complete DHCP post-install: create security groups and authorize in AD",
+          "  netsh dhcp add securitygroups",
+          "  Restart-Service dhcpserver -Force",
+          "  $fqdn = \"$env:COMPUTERNAME.{{ DomainFqdn }}\"",
+          "  $ip = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.PrefixOrigin -ne 'WellKnown' } | Select-Object -First 1).IPAddress",
+          "  if (-not (Get-DhcpServerInDC | Where-Object { $_.DnsName -eq $fqdn })) { Add-DhcpServerInDC -DnsName $fqdn -IPAddress $ip; Write-Host \"DHCP server $fqdn authorized in AD\" } else { Write-Host \"DHCP server $fqdn already authorized\" }",
+          "  Write-Host 'DHCP security groups created (DHCP Administrators, DHCP Users)'",
           "  if (-not (Get-ADUser -Filter \"UserPrincipalName -eq '$upn'\" -ErrorAction SilentlyContinue)) { New-ADUser -Name $username -SamAccountName $username -UserPrincipalName $upn -AccountPassword $password -Enabled $true; Write-Host \"Created user $upn\" } else { Write-Host \"User $upn already exists\" }",
           "  foreach ($grp in @('Domain Users','Remote Management Users','DNSAdmins','DHCP Administrators')) { try { Add-ADGroupMember -Identity $grp -Members $username -ErrorAction Stop; Write-Host \"Added to $grp\" } catch { if ($_.Exception.Message -match 'already a member') { Write-Host \"Already in $grp\" } elseif ($_.Exception.Message -match 'Cannot find an object with identity') { Write-Host \"Group $grp not found, skipping\" } else { throw } } }",
           "} else { Write-Host \"Non-DC host, skipping AD user creation\" }",
@@ -727,21 +734,27 @@ resource "aws_ssm_document" "credential_setup" {
           "Set-Item WSMan:\\localhost\\Client\\TrustedHosts -Value '{{ TrustedHosts }}' -Force",
           "# Grant WMI permissions (Remote Enable + Execute Methods) on DNS and DHCP namespaces",
           "function Set-WmiNamespaceSecurity($ns, $account) {",
+          "  Write-Host \"[WMI] Setting permissions: namespace=$ns account=$account\"",
           "  $sec = ([wmiclass]\"\\\\localhost\\$($ns):__SystemSecurity\")",
           "  $sd = $sec.GetSecurityDescriptor().Descriptor",
-          "  $sid = (New-Object System.Security.Principal.NTAccount($account)).Translate([System.Security.Principal.SecurityIdentifier])",
+          "  for ($i = 1; $i -le 12; $i++) { try { $sid = (New-Object System.Security.Principal.NTAccount($account)).Translate([System.Security.Principal.SecurityIdentifier]); Write-Host \"[WMI] Resolved $account -> SID=$($sid.Value)\"; break } catch { if ($i -eq 12) { throw } else { Write-Host \"[WMI] Retry $i/12: $account not resolvable yet - $($_.Exception.Message)\"; Start-Sleep -Seconds 10 } } }",
           "  $ace = ([wmiclass]'Win32_ACE').CreateInstance()",
           "  $trustee = ([wmiclass]'Win32_Trustee').CreateInstance()",
           "  $trustee.SIDString = $sid.Value",
-          "  $ace.AccessMask = 0x21",
+          "  $ace.AccessMask = 0x23",
           "  $ace.AceType = 0",
           "  $ace.AceFlags = 0",
           "  $ace.Trustee = $trustee",
           "  $sd.DACL += $ace",
           "  $sec.SetSecurityDescriptor($sd) | Out-Null",
+          "  $newSd = $sec.GetSecurityDescriptor().Descriptor",
+          "  Write-Host \"[WMI] DACL for $ns now has $($newSd.DACL.Count) entries:\"",
+          "  foreach ($a in $newSd.DACL) { $name = try { (New-Object System.Security.Principal.SecurityIdentifier($a.Trustee.SIDString)).Translate([System.Security.Principal.NTAccount]).Value } catch { $a.Trustee.SIDString }; Write-Host \"  - $name (AccessMask=0x$($a.AccessMask.ToString('X')))\" }",
           "}",
-          "foreach ($ns in @('Root/Microsoft/Windows/DNS')) { Set-WmiNamespaceSecurity $ns $username; Set-WmiNamespaceSecurity $ns 'DNSAdmins'; Write-Host \"WMI: $username + DNSAdmins granted on $ns\" }",
-          "try { foreach ($acct in @($username, 'DNSAdmins')) { Set-WmiNamespaceSecurity 'Root/Microsoft/Windows/DHCP' $acct }; Write-Host \"WMI: $username + DNSAdmins granted on Root/Microsoft/Windows/DHCP\" } catch { Write-Host \"DHCP WMI namespace not available, skipping: $($_.Exception.Message)\" }",
+          "$domainPrefix = '{{ DomainFqdn }}'.Split('.')[0].ToUpper()",
+          "Write-Host \"[WMI] domainPrefix=$domainPrefix username=$username hostname=$(hostname)\"",
+          "foreach ($ns in @('Root/Microsoft/Windows/DNS')) { Set-WmiNamespaceSecurity $ns \"$domainPrefix\\$username\"; Set-WmiNamespaceSecurity $ns \"$domainPrefix\\DNSAdmins\"; Write-Host \"WMI: $username + DNSAdmins granted on $ns\" }",
+          "try { foreach ($acct in @(\"$domainPrefix\\$username\", \"$domainPrefix\\DNSAdmins\")) { Set-WmiNamespaceSecurity 'Root/Microsoft/Windows/DHCP' $acct }; Write-Host \"WMI: $username + DNSAdmins granted on Root/Microsoft/Windows/DHCP\" } catch { Write-Host \"DHCP WMI namespace not available, skipping: $($_.Exception.Message)\" }",
           "if ($isBootstrap) {",
           "  $u = Get-ADUser -Identity $username -Properties MemberOf,UserPrincipalName,Enabled,WhenCreated",
           "  Write-Host '--- User Details ---'",
@@ -787,7 +800,7 @@ resource "aws_ssm_association" "credential_setup" {
     }
   }
 
-  wait_for_success_timeout_seconds = 300
+  wait_for_success_timeout_seconds = 600
 
   depends_on = [time_sleep.wait_for_join_reboot]
 }
