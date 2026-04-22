@@ -301,7 +301,8 @@ resource "aws_ssm_document" "configure_networking" {
           "$dns = '{{ DnsList }}'.Split(',')",
           "Set-DnsClientServerAddress -InterfaceIndex $ifIndex -ServerAddresses $dns",
           "if (-not (Get-NetRoute -DestinationPrefix '169.254.169.254/32' -ErrorAction SilentlyContinue)) { New-NetRoute -DestinationPrefix '169.254.169.254/32' -InterfaceIndex $ifIndex -NextHop '{{ Gateway }}' -RouteMetric 10 -ErrorAction SilentlyContinue }",
-          "Set-NetConnectionProfile -InterfaceIndex $ifIndex -NetworkCategory Private -ErrorAction SilentlyContinue"
+          "Set-NetConnectionProfile -InterfaceIndex $ifIndex -NetworkCategory Private -ErrorAction SilentlyContinue",
+          "Enable-NetFirewallRule -Name 'FPS-ICMP4-ERQ-In' -ErrorAction SilentlyContinue"
         ]
       }
     }]
