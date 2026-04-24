@@ -126,7 +126,7 @@ function Test-WinRMService {
     Write-Check "WinRM HTTP listener configured" $hasListener
 
     if (-not $hasListener -and $Fix) {
-        Enable-PSRemoting -Force -SkipNetworkProfileCheck
+        Enable-PSRemoting -Force -SkipNetworkProfileCheck | Out-Null
         Write-Fixed "Enable-PSRemoting executed"
     }
 }
@@ -145,7 +145,7 @@ function Test-CredSSPServer {
     Write-Check "CredSSP server role enabled" $credSsp
 
     if (-not $credSsp -and $Fix) {
-        Enable-WSManCredSSP -Role Server -Force
+        Enable-WSManCredSSP -Role Server -Force | Out-Null
         Write-Fixed "CredSSP server role enabled"
     }
 }
@@ -283,7 +283,7 @@ function Test-CredSSPClient {
     if (-not $allDelegated -and $Fix) {
         foreach ($ip in $Targets) {
             if (-not ($credSspOut -match [regex]::Escape("wsman/$ip"))) {
-                Enable-WSManCredSSP -Role Client -DelegateComputer $ip -Force
+                Enable-WSManCredSSP -Role Client -DelegateComputer $ip -Force | Out-Null
                 Write-Fixed "CredSSP client delegation added for $ip"
             }
         }
@@ -516,7 +516,7 @@ function Test-WinRMFirewall {
             Write-Fixed "WinRM firewall rule enabled for all remote addresses"
         } catch {
             try {
-                Enable-PSRemoting -Force -SkipNetworkProfileCheck
+                Enable-PSRemoting -Force -SkipNetworkProfileCheck | Out-Null
                 Write-Fixed "Enable-PSRemoting re-run to create firewall rules"
             } catch {
                 Write-Host "  [ERROR] Could not configure firewall: $($_.Exception.Message)" -ForegroundColor Red
