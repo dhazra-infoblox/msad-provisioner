@@ -166,12 +166,12 @@ function Test-WmiDhcpPermissions {
     } catch {}
 
     if (-not $hasDhcpNs) {
-        Write-Check "DHCP WMI namespace exists" $false "Namespace $ns not found — is DHCP installed?"
+        Write-Check "DHCP WMI namespace exists" $false "Namespace $ns not found -- is DHCP installed?"
         return
     }
     Write-Check "DHCP WMI namespace exists" $true
 
-    # Resolve the account to check — use DOMAIN\user format
+    # Resolve the account to check -- use DOMAIN\user format
     $domainPrefix = ($env:USERDOMAIN)
     if (-not $domainPrefix) { $domainPrefix = (Get-WmiObject Win32_ComputerSystem).Domain.Split('.')[0].ToUpper() }
     $fullAccount = if ($Account -match '\\') { $Account } else { "$domainPrefix\$Account" }
@@ -469,7 +469,7 @@ function Test-NetworkConnectivity {
             if ($waited -and $tcp.Connected) { $reachable = $true }
             $tcp.Close()
         } catch {}
-        Write-Check "TCP connection to ${ip}:5985" $reachable $(if (-not $reachable) { "Cannot connect — check WinRM on target and firewall rules" } else { "" })
+        Write-Check "TCP connection to ${ip}:5985" $reachable $(if (-not $reachable) { "Cannot connect -- check WinRM on target and firewall rules" } else { "" })
     }
 }
 
@@ -541,7 +541,7 @@ function Test-PSRemotingConnectivity {
         } catch {
             $reachable = $false
         }
-        Write-Check "WSMan responds on $ip" $reachable $(if (-not $reachable) { "WinRM not reachable — ensure Enable-PSRemoting and CredSSP Server are configured on that host" } else { "" })
+        Write-Check "WSMan responds on $ip" $reachable $(if (-not $reachable) { "WinRM not reachable -- ensure Enable-PSRemoting and CredSSP Server are configured on that host" } else { "" })
     }
 }
 
