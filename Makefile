@@ -2,7 +2,7 @@ CONFIG  ?= config/environment.yml
 TF_DIR  ?= terraform
 TF_VARS ?= -var="config_file=../$(CONFIG)" -var-file="secret.tfvars"
 
-.PHONY: help login vault-start vault-stop vault-status vault-setup init validate plan apply destroy redeploy output status progress logs creds
+.PHONY: help login vault-start vault-stop vault-status vault-setup init validate plan apply destroy redeploy output status progress logs creds check-prereqs fix-prereqs
 
 help:
 	@echo "Targets:"
@@ -29,8 +29,13 @@ help:
 	@echo "  make logs PHASE=x HOST=y RUN=N   - show run N"
 	@echo "  make creds           - list all VM credential Vault paths"
 	@echo "  make creds HOST=name - show credentials for a specific VM"
+	@echo "  make check-prereqs HOST=name   - check Infoblox DHCP prerequisites on a host"
+	@echo "  make fix-prereqs HOST=name     - check and fix prerequisites on a host"
 
-AWS_PROFILE ?= $(shell python3 -c "import yaml; print(yaml.safe_load(open('$(CONFIG)'))['aws']['profile'])" 2>/dev/null || echo "dibya-aws")
+# Helper: extract a field from a YAML section using awk (no pyyaml dependency).
+_yaml_field = $(shell awk -v sec="$(1)" -v key="$(2)" '$$0 ~ "^"sec":" { in_sec=1; next } in_sec && /^[^[:space:]]/ { in_sec=0 } in_sec && $$1 == key":" { $$1=""; sub(/^[[:space:]]+/, ""); gsub(/["'"'"']/, ""); print; exit }' $(CONFIG))
+
+AWS_PROFILE ?= $(or $(call _yaml_field,aws,profile),dibya-aws)
 
 login:
 	aws sso login --profile $(AWS_PROFILE)
@@ -110,3 +115,59 @@ creds:
 			python3 -c "import sys,json; d=json.load(sys.stdin)['data']['data']; [print(f'{k}: {v}') for k,v in d.items()]" || \
 			echo "Not found. Ensure apply ran with key_pair_pem_path set and HOST=$(HOST) exists."; \
 	fi
+
+AWS_REGION      ?= $(call _yaml_field,aws,region)
+
+_require_host:
+	@if [ -z "$(HOST)" ]; then echo "ERROR: HOST is required. Usage: make $@ HOST=client01"; exit 1; fi
+
+_resolve_instance_id:
+	$(eval INSTANCE_ID := $(shell terraform -chdir=$(TF_DIR) output -json host_inventory 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('$(HOST)',{}).get('instance_id',''))" 2>/dev/null))
+	@if [ -z "$(INSTANCE_ID)" ]; then echo "ERROR: Could not resolve instance ID for HOST=$(HOST). Run 'make apply' first."; exit 1; fi
+
+
+# ---------------------------------------------------------------------------
+# Prerequisite checker: run check-prerequisites.ps1 on a host via SSM.
+# Usage: make check-prereqs HOST=dhcp01
+#        make fix-prereqs   HOST=client01
+# Auto-detects role from Terraform host_inventory.
+# ---------------------------------------------------------------------------
+
+DOMAIN_FQDN ?= $(call _yaml_field,domain,fqdn)
+SVC_USER    ?= $(call _yaml_field,credentials,service_user)
+
+_resolve_role = $(eval HOST_ROLE := $(shell terraform -chdir=$(TF_DIR) output -json host_inventory 2>/dev/null | \
+	python3 -c "import sys,json; print(json.load(sys.stdin).get('$(HOST)',{}).get('role',''))" 2>/dev/null))
+
+_resolve_targets = $(eval TARGET_IPS := $(shell terraform -chdir=$(TF_DIR) output -json host_inventory 2>/dev/null | \
+	python3 -c "import sys,json; inv=json.load(sys.stdin); print(','.join(v['private_ip'] for k,v in inv.items() if v.get('role') in ('dhcp_server','domain_controller') and k != '$(HOST)'))" 2>/dev/null))
+
+_map_role = $(if $(filter agent_client,$(HOST_ROLE)),AgentClient,$(if $(filter dhcp_server,$(HOST_ROLE)),DhcpServer,$(if $(filter domain_controller,$(HOST_ROLE)),DomainController,)))
+
+check-prereqs: _require_host _resolve_instance_id
+	$(_resolve_role)
+	$(_resolve_targets)
+	$(eval PS_ROLE := $(call _map_role))
+	@if [ -z "$(PS_ROLE)" ]; then echo "ERROR: Could not determine role for HOST=$(HOST) (role='$(HOST_ROLE)')"; exit 1; fi
+	@echo "=== Checking prerequisites on $(HOST) ($(INSTANCE_ID)) role=$(PS_ROLE) ==="
+	@scripts/run_prereqs_via_ssm.sh \
+		--profile "$(AWS_PROFILE)" --region "$(AWS_REGION)" \
+		--instance-id "$(INSTANCE_ID)" \
+		--role "$(PS_ROLE)" \
+		--script scripts/check-prerequisites.ps1 \
+		$(if $(filter AgentClient,$(PS_ROLE)),--targets "$(TARGET_IPS)" --domain "$(DOMAIN_FQDN)",) \
+		$(if $(filter DomainController DhcpServer,$(PS_ROLE)),--service-user "$(SVC_USER)",)
+
+fix-prereqs: _require_host _resolve_instance_id
+	$(_resolve_role)
+	$(_resolve_targets)
+	$(eval PS_ROLE := $(call _map_role))
+	@if [ -z "$(PS_ROLE)" ]; then echo "ERROR: Could not determine role for HOST=$(HOST) (role='$(HOST_ROLE)')"; exit 1; fi
+	@echo "=== Checking & FIXING prerequisites on $(HOST) ($(INSTANCE_ID)) role=$(PS_ROLE) ==="
+	@scripts/run_prereqs_via_ssm.sh \
+		--profile "$(AWS_PROFILE)" --region "$(AWS_REGION)" \
+		--instance-id "$(INSTANCE_ID)" \
+		--role "$(PS_ROLE)" --fix \
+		--script scripts/check-prerequisites.ps1 \
+		$(if $(filter AgentClient,$(PS_ROLE)),--targets "$(TARGET_IPS)" --domain "$(DOMAIN_FQDN)",) \
+		$(if $(filter DomainController DhcpServer,$(PS_ROLE)),--service-user "$(SVC_USER)",)
