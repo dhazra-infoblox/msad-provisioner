@@ -956,7 +956,7 @@ resource "vault_kv_secret_v2" "rdp_credentials" {
   name  = "${trimspace(local.rdp_vault_prefix)}/${each.key}"
 
   data_json = jsonencode({
-    username    = "CORP\\Administrator"
+    username    = local.domain.admin_user
     password    = local.domain_admin_password
     instance_id = each.value.id
     private_ip  = each.value.private_ip
