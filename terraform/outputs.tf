@@ -52,10 +52,3 @@ output "ssm_logs_s3_path" {
   value       = local.ssm_logs_enabled ? "s3://${local.ssm_log_bucket}/${local.ssm_log_prefix}/" : "disabled"
 }
 
-output "rdp_credentials_vault_paths" {
-  description = "Vault KV paths where per-host RDP credentials are stored"
-  value = {
-    for host, secret in vault_kv_secret_v2.rdp_credentials :
-    host => "${try(local.vault_cfg.mount, "secret")}/data/${secret.name}"
-  }
-}

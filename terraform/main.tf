@@ -6,10 +6,6 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
-    vault = {
-      source  = "hashicorp/vault"
-      version = "~> 4.0"
-    }
     time = {
       source  = "hashicorp/time"
       version = "~> 0.9"
@@ -23,13 +19,9 @@ locals {
   domain      = local.config.domain
   network     = local.config.network
   credentials = local.config.credentials
-  vault_cfg   = try(local.config.vault, {})
   hosts       = local.config.hosts
 
-  vault_enabled    = try(local.vault_cfg.enabled, false)
-  rdp_key_path     = trimspace(var.key_pair_pem_path)
-  rdp_store_enabled = try(local.vault_cfg.store_rdp_credentials, false) && local.rdp_key_path != ""
-  rdp_vault_prefix  = try(local.vault_cfg.rdp_credentials_path_prefix, "msad/rdp")
+  rdp_key_path = trimspace(var.key_pair_pem_path)
 
   allowed_roles      = ["dhcp_server", "agent_client", "domain_controller"]
   host_map           = { for h in local.hosts : h.name => h }
@@ -128,34 +120,6 @@ check "ip_capacity" {
   assert {
     condition     = length(local.available_ips) >= length(local.ordered_host_names)
     error_message = "Not enough available IP addresses in selected subnet for declared hosts."
-  }
-}
-
-check "rdp_store_requires_vault" {
-  assert {
-    condition     = !local.rdp_store_enabled || local.vault_enabled
-    error_message = "vault.store_rdp_credentials requires vault.enabled=true."
-  }
-}
-
-check "rdp_key_path_set" {
-  assert {
-    condition     = !local.rdp_store_enabled || trimspace(local.rdp_key_path) != ""
-    error_message = "Set aws.key_pair_private_key_path to decrypt Windows password_data before storing in Vault."
-  }
-}
-
-check "rdp_key_file_exists" {
-  assert {
-    condition     = !local.rdp_store_enabled || fileexists(local.rdp_key_path)
-    error_message = "aws.key_pair_private_key_path does not exist or is not readable."
-  }
-}
-
-check "rdp_vault_prefix_set" {
-  assert {
-    condition     = !local.rdp_store_enabled || trimspace(local.rdp_vault_prefix) != ""
-    error_message = "Set vault.rdp_credentials_path_prefix when storing RDP credentials in Vault."
   }
 }
 
@@ -947,21 +911,4 @@ resource "aws_ssm_association" "agent_setup" {
   wait_for_success_timeout_seconds = 300
 
   depends_on = [aws_ssm_association.credential_setup]
-}
-
-resource "vault_kv_secret_v2" "rdp_credentials" {
-  for_each = local.rdp_store_enabled ? aws_instance.nodes : {}
-
-  mount = try(local.vault_cfg.mount, "secret")
-  name  = "${trimspace(local.rdp_vault_prefix)}/${each.key}"
-
-  data_json = jsonencode({
-    username    = local.domain.admin_user
-    password    = local.domain_admin_password
-    instance_id = each.value.id
-    private_ip  = each.value.private_ip
-    host        = each.key
-  })
-
-  depends_on = [aws_instance.nodes]
 }
