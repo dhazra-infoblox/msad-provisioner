@@ -1,7 +1,7 @@
 # Plan: Add Dev Workstation VM Role to msad-provisioner
 
 ## TL;DR
-Extend msad-provisioner Terraform to support standalone Windows dev workstations (non-domain-joined) with 16GB RAM, 300GB disk, and preinstalled dev tools. Add a new "dev_workstation" role that provisions VMs via SSM with automated tool installation. Template: Reference 172.28.24.112's existing setup (Visual Studio 2022 Community with WiX extensions, WiX v3 command-line tools, Git, GitHub CLI, .NET 8 SDK, Go).
+Extend msad-provisioner Terraform to support standalone Windows dev workstations (non-domain-joined) with 16GB RAM, 300GB disk, and preinstalled dev tools. Add a new "dev_workstation" role that provisions VMs via SSM with automated tool installation. Template: Based on existing dev machine setup (Visual Studio 2022 Community with WiX extensions, WiX v3 command-line tools, Git, GitHub CLI, .NET 8 SDK, Go).
 
 ## Steps
 
@@ -39,7 +39,7 @@ Extend msad-provisioner Terraform to support standalone Windows dev workstations
      - Microsoft Edge browser
      - Logs output for verification
    - Consider: Chocolatey silent installs or direct MSI/EXE downloads for reproducibility
-   - Reference: 172.28.24.112's working tool list for exact versions
+   - Reference: existing dev machine's confirmed tool list for exact versions
 
 4. **Add dev_workstation phase orchestration in Terraform**
    - Use `time_sleep` to sequence phases: rename → configure_networking → install_dev_tools
