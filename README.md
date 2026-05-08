@@ -8,7 +8,6 @@ Automated provisioning of Windows Server VMs with Active Directory, DHCP, DNS, C
 |------|---------|---------|
 | Terraform | >= 1.5 | `brew install terraform` |
 | AWS CLI | v2 | `brew install awscli` |
-| Vault | any | `brew install vault` |
 
 You also need an AWS SSO profile, an EC2 key pair, and a VPC with a subnet and security group.
 
@@ -24,12 +23,6 @@ key_pair_pem_path  = "/path/to/your-key.pem"
 EOF
 
 make login
-
-# Optional: Vault for RDP credential storage
-make vault-start
-export VAULT_ADDR=http://127.0.0.1:8200
-export VAULT_TOKEN=dev-root
-make vault-setup
 
 make init && make apply
 make progress   # monitor phase status
@@ -69,9 +62,25 @@ For a full teardown and rebuild: `make redeploy`
 | `make logs PHASE=x HOST=y` | View SSM script output |
 | `make logs PHASE=x HOST=y RUN=all` | List all runs with timestamps |
 | `make status` | Host inventory |
-| `make creds HOST=x` | RDP credentials from Vault |
+| `make creds HOST=x` | RDP credentials for a host |
 
-## SSM Logs
+## VM Credentials
+
+Credentials are read directly from local files — no secrets server required.
+
+```bash
+make creds              # table of all hosts (instance ID, IP, username, password)
+make creds HOST=dhcp01  # details for a single host
+```
+
+Sources used:
+- **Username** — `domain.admin_user` in `config/environment.yml`
+- **Password** — `admin_password` in `terraform/secret.tfvars`
+- **Instance ID / IP** — `terraform output host_inventory` (from state)
+
+Both config files are gitignored and stay on disk, so credentials are always available after `make apply` without any additional setup.
+
+
 
 Script output goes to S3 (not Terraform stdout). Configure in `environment.yml`:
 
@@ -89,6 +98,7 @@ terraform/main.tf            # VM + SSM provisioning (8 phases)
 terraform/secret.tfvars      # Passwords (gitignored)
 scripts/progress.sh          # SSM phase progress viewer
 scripts/ssm_logs.sh          # S3 log viewer
+scripts/creds.sh             # VM credential lookup
 Makefile                     # All commands
 TROUBLESHOOTING.md           # Debugging guide
 ```
