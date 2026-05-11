@@ -1,5 +1,0 @@
-# Terraform now reads settings from YAML.
-# Copy this to terraform.tfvars if you need a non-default config path.
-
-# Example path from terraform/ directory:
-config_file = "../config/environment.yml"
