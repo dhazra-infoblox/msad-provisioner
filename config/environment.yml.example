@@ -1,3 +1,24 @@
+# ---------------------------------------------------------------------------
+# Multi-setup usage
+# ---------------------------------------------------------------------------
+# This file configures ONE MSAD setup (one domain + its hosts). To run
+# multiple independent setups (each with its own domain), create additional
+# config files using this exact same schema:
+#
+#   config/environment.yml        ← default setup  (make apply)
+#   config/lab1.yml               ← named setup     (make apply SETUP=lab1)
+#   config/lab2.yml               ← another setup   (make apply SETUP=lab2)
+#
+# Each named setup also needs its own secret file (same keys as secret.tfvars):
+#   terraform/secret.lab1.tfvars
+#
+# Important constraints when multiple setups share the same VPC/subnet:
+#   - name_prefix must be unique per setup (it drives SSM document names in AWS)
+#     e.g.  default → msad_corp,  lab1 → msad_lab1,  lab2 → msad_lab2
+#   - network.ip_start_offset must use non-overlapping ranges
+#     e.g.  default → 10,  lab1 → 30,  lab2 → 50  (assuming ≤ 20 hosts per setup)
+# ---------------------------------------------------------------------------
+
 aws:
   profile: your-aws-profile
   region: us-east-1

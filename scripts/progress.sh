@@ -3,6 +3,7 @@ set -euo pipefail
 
 TF_DIR="terraform"
 CONFIG_FILE="${CONFIG_FILE:-config/environment.yml}"
+TF_WORKSPACE="${TF_WORKSPACE:-default}"
 
 extract_aws_field() {
   local field="$1"
@@ -37,6 +38,9 @@ if [ -z "${aws_profile:-}" ] || [ -z "${aws_region:-}" ]; then
   echo "Could not read aws.profile/aws.region from $CONFIG_FILE"
   exit 1
 fi
+
+terraform -chdir="$TF_DIR" workspace select "$TF_WORKSPACE" >/dev/null 2>&1 \
+  || { echo "Workspace '$TF_WORKSPACE' not found — run 'make apply SETUP=$TF_WORKSPACE' first"; exit 1; }
 
 if ! terraform -chdir="$TF_DIR" output -json phase_association_ids >/dev/null 2>&1; then
   echo "No phase_association_ids output found. Run apply first."

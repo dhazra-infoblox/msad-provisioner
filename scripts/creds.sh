@@ -9,7 +9,8 @@ set -euo pipefail
 
 TF_DIR="terraform"
 CONFIG_FILE="${CONFIG_FILE:-config/environment.yml}"
-SECRET_TFVARS="${TF_DIR}/secret.tfvars"
+SECRET_TFVARS="${SECRET_TFVARS:-${TF_DIR}/secret.tfvars}"
+TF_WORKSPACE="${TF_WORKSPACE:-default}"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
@@ -27,6 +28,9 @@ admin_password=$(grep -E '^[[:space:]]*admin_password[[:space:]]*=' "$SECRET_TFV
 
 [ -n "$admin_user" ]    || die "Could not read domain.admin_user from $CONFIG_FILE"
 [ -n "$admin_password" ] || die "Could not read admin_password from $SECRET_TFVARS"
+
+terraform -chdir="$TF_DIR" workspace select "$TF_WORKSPACE" >/dev/null 2>&1 \
+  || die "Workspace '$TF_WORKSPACE' not found — run 'make apply SETUP=$TF_WORKSPACE' first"
 
 inventory=$(terraform -chdir="$TF_DIR" output -json host_inventory 2>/dev/null) \
   || die "Could not read terraform output — has 'make apply' been run?"
