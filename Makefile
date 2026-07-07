@@ -1,4 +1,4 @@
-SETUP_TARGETS := create-setup validate plan apply destroy redeploy output status progress creds
+SETUP_TARGETS := create-setup validate plan apply destroy redeploy output status progress creds deploy-perf-scripts
 POSITIONAL_SETUP := $(word 2,$(MAKECMDGOALS))
 
 ifeq ($(origin SETUP), undefined)
@@ -57,6 +57,8 @@ help:
 	@echo "  make logs PHASE=x HOST=y RUN=N   - show run N"
 	@echo "  make creds           - show all VM credentials"
 	@echo "  make creds HOST=name - show credentials for one VM"
+	@echo "  make deploy-perf-scripts [SETUP=name] [SCOPE_COUNT=500] [RESERVATIONS_PER_SCOPE=0]"
+	@echo "                       - upload bulk_dhcp_load.ps1 to DHCP servers and performance.ps1 to agent clients"
 
 AWS_PROFILE ?= $(shell python3 -c "import yaml; print(yaml.safe_load(open('$(CONFIG)'))['aws']['profile'])" 2>/dev/null || echo "dibya-aws")
 
@@ -113,3 +115,16 @@ logs:
 HOST ?=
 creds: ensure-workspace
 	@CONFIG_FILE=$(CONFIG) TF_WORKSPACE=$(SETUP) SECRET_TFVARS=$(TF_DIR)/$(SECRET_FILE) ./scripts/creds.sh $(HOST)
+
+# Performance testing script deployment
+# Uploads bulk_dhcp_load.ps1 (→ DHCP servers) and performance.ps1 (→ agent clients) via SSM.
+# Usage:
+#   make deploy-perf-scripts SETUP=nstarqa
+#   make deploy-perf-scripts SETUP=nstarqa SCOPE_COUNT=1000 RESERVATIONS_PER_SCOPE=10
+#   make deploy-perf-scripts SETUP=nstarqa DRY_RUN=1   (preview without executing)
+SCOPE_COUNT             ?= 500
+RESERVATIONS_PER_SCOPE  ?= 0
+DRY_RUN                 ?= 0
+deploy-perf-scripts: ensure-workspace
+	@SETUP=$(SETUP) SCOPE_COUNT=$(SCOPE_COUNT) RESERVATIONS_PER_SCOPE=$(RESERVATIONS_PER_SCOPE) \
+		DRY_RUN=$(DRY_RUN) bash ./scripts/deploy_perf_scripts.sh
