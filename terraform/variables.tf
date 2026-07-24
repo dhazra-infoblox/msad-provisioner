@@ -1,64 +1,37 @@
-# Terraform Variables for vSphere VM Provisioning
-
-variable "vcenter_server" {
-  description = "vCenter Server hostname or IP"
+variable "config_file" {
+  description = "Path to YAML configuration file"
   type        = string
+  default     = "../config/environment.yml"
 }
 
-variable "vcenter_user" {
-  description = "vCenter username"
-  type        = string
+variable "default_tags" {
+  description = "Default tags applied to all AWS resources"
+  type        = map(string)
+  default = {
+    project = "msad-provisioner"
+  }
 }
 
-variable "vcenter_password" {
-  description = "vCenter password"
+variable "admin_password" {
+  description = "Domain administrator password (also used for domain join)"
   type        = string
   sensitive   = true
 }
 
-variable "datacenter" {
-  description = "vSphere datacenter name"
+variable "safe_mode_password" {
+  description = "Active Directory DSRM (safe mode) password"
   type        = string
+  sensitive   = true
 }
 
-variable "cluster" {
-  description = "vSphere cluster name"
+variable "service_password" {
+  description = "Service account password for the Infoblox agent user"
   type        = string
+  sensitive   = true
 }
 
-variable "template" {
-  description = "VM template name to clone from"
+variable "key_pair_pem_path" {
+  description = "Absolute path to the EC2 key pair .pem file used to decrypt Windows Administrator passwords"
   type        = string
-}
-
-variable "datastore" {
-  description = "vSphere datastore name"
-  type        = string
-}
-
-variable "network" {
-  description = "vSphere network name"
-  type        = string
-}
-
-variable "vm_folder" {
-  description = "VM folder name"
-  type        = string
-  default     = "MSAD-Provisioning"
-}
-
-# VM Configuration Map
-variable "vms" {
-  description = "Map of VMs to provision"
-  type = map(object({
-    name       = string
-    ip_address = string
-    subnet_mask = string
-    gateway    = string
-    dns_servers = list(string)
-    cpu        = number
-    memory     = number
-    disk       = number
-  }))
-  default = {}
+  default     = ""
 }

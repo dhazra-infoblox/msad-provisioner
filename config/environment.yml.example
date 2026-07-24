@@ -1,0 +1,79 @@
+# ---------------------------------------------------------------------------
+# Multi-setup usage
+# ---------------------------------------------------------------------------
+# This file configures ONE MSAD setup (one domain + its hosts). To run
+# multiple independent setups (each with its own domain), create additional
+# config files using this exact same schema:
+#
+#   config/environment.yml        ← default setup  (make apply)
+#   config/lab1.yml               ← named setup     (make apply SETUP=lab1)
+#   config/lab2.yml               ← another setup   (make apply SETUP=lab2)
+#
+# Each named setup also needs its own secret file (same keys as secret.tfvars):
+#   terraform/secret.lab1.tfvars
+#
+# Important constraints when multiple setups share the same VPC/subnet:
+#   - name_prefix must be unique per setup (it drives SSM document names in AWS)
+#     e.g.  default → msad_corp,  lab1 → msad_lab1,  lab2 → msad_lab2
+#   - network.ip_start_offset must use non-overlapping ranges
+#     e.g.  default → 10,  lab1 → 30,  lab2 → 50  (assuming ≤ 20 hosts per setup)
+# ---------------------------------------------------------------------------
+
+aws:
+  profile: your-aws-profile
+  region: us-east-1
+  vpc_id: vpc-xxxxxxxx
+  subnet_id: subnet-xxxxxxxx
+  security_group_ids:
+    - sg-xxxxxxxx
+  default_ami_id: ami-xxxxxxxxxxxxxxxxx
+  default_instance_type: t2.xlarge
+  associate_public_ip: false
+  key_name: your-key-pair
+  instance_profile_name: AmazonSSMRoleForInstancesQuickSetup
+  imds_http_tokens: optional
+  imds_instance_metadata_tags: disabled
+  root_volume_encrypted: true
+  # Optional KMS key for root disk encryption.
+  # root_volume_kms_key_id: arn:aws:kms:us-east-1:123456789012:key/your-key-id
+  name_prefix: msad_dhcp
+  environment: dev
+  tags:
+    owner: your-team
+
+domain:
+  fqdn: corp.local
+  netbios: CORP
+  admin_user: CORP\Administrator
+
+network:
+  # Optional. Defaults to first subnet host address (x.x.x.1).
+  # gateway: 172.28.4.1
+  # Optional. Defaults to bootstrap host assigned IP.
+  # dns_servers:
+  #   - 172.28.4.11
+  #   - 127.0.0.1
+  ip_start_offset: 10
+
+credentials:
+  service_user: infoblox_agent
+
+# Optional. Omit or remove s3_bucket to disable SSM output logging.
+# ssm_logs:
+#   s3_bucket: your-bucket-name
+#   s3_prefix: ssm-logs
+
+hosts:
+  - name: dhcp01
+    role: dhcp_server
+    bootstrap: true
+    instance_type: t3.large
+    disk_gb: 100
+  - name: dhcp02
+    role: dhcp_server
+    instance_type: t3.large
+    disk_gb: 100
+  - name: client01
+    role: agent_client
+    instance_type: t3.medium
+    disk_gb: 80
