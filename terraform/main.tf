@@ -41,18 +41,36 @@ locals {
     for i in range(local.ip_start_offset, local.host_space - 2) : cidrhost(data.aws_subnet.selected.cidr_block, i)
   ]
 
-  used_ips = distinct(flatten([
-    for eni in data.aws_network_interface.subnet_eni : eni.private_ips
-  ]))
+  # AUTO-ASSIGNMENT IS FOR INITIAL DEPLOYMENT ONLY.
+  # After the first apply, run `make lock-ips <setup>` to stamp the assigned IPs
+  # into the config YAML as explicit `ip:` fields. Without this, adding or removing
+  # any host shifts the index → existing hosts get new IPs → forced EC2 replacement.
+  pinned_ip_by_host = { for name, h in local.host_map : name => h.ip if can(h.ip) }
+  unpinned_names    = [for name in local.ordered_host_names : name if !can(local.host_map[name].ip)]
+
+  # When every host is pinned there is nothing to auto-assign, so the subnet ENI
+  # scan below is skipped entirely. That avoids a race where an ENI belonging to
+  # another setup is deleted between the list and the per-ENI read.
+  all_hosts_pinned = length(local.unpinned_names) == 0
+
+  used_ips = distinct(concat(
+    flatten([for eni in data.aws_network_interface.subnet_eni : eni.private_ips]),
+    values(local.pinned_ip_by_host)
+  ))
 
   available_ips = [for ip in local.candidate_ips : ip if !contains(local.used_ips, ip)]
 
+  # Only unpinned hosts draw from the pool, so a pinned host never consumes a slot.
   assigned_ips_by_host = {
-    for idx, name in local.ordered_host_names : name => local.available_ips[idx]
+    for idx, name in local.unpinned_names : name => local.available_ips[idx]
+  }
+
+  effective_ip_by_host = {
+    for name, h in local.host_map : name => try(h.ip, local.assigned_ips_by_host[name])
   }
 
   gateway_ip  = try(local.network.gateway, cidrhost(data.aws_subnet.selected.cidr_block, 1))
-  primary_dns = try(local.assigned_ips_by_host[local.bootstrap_host], cidrhost(data.aws_subnet.selected.cidr_block, 2))
+  primary_dns = try(local.effective_ip_by_host[local.bootstrap_host], cidrhost(data.aws_subnet.selected.cidr_block, 2))
   dns_servers = length(try(local.network.dns_servers, [])) > 0 ? local.network.dns_servers : [local.primary_dns]
   vpc_dns     = cidrhost(data.aws_vpc.selected.cidr_block, 2)
 
@@ -84,6 +102,8 @@ data "aws_subnet" "selected" {
 }
 
 data "aws_network_interfaces" "subnet" {
+  count = local.all_hosts_pinned ? 0 : 1
+
   filter {
     name   = "subnet-id"
     values = [local.aws_config.subnet_id]
@@ -91,7 +111,7 @@ data "aws_network_interfaces" "subnet" {
 }
 
 data "aws_network_interface" "subnet_eni" {
-  for_each = toset(data.aws_network_interfaces.subnet.ids)
+  for_each = toset(try(data.aws_network_interfaces.subnet[0].ids, []))
   id       = each.key
 }
 
@@ -118,8 +138,8 @@ check "single_bootstrap" {
 
 check "ip_capacity" {
   assert {
-    condition     = length(local.available_ips) >= length(local.ordered_host_names)
-    error_message = "Not enough available IP addresses in selected subnet for declared hosts."
+    condition     = length(local.available_ips) >= length(local.unpinned_names)
+    error_message = "Not enough available IP addresses in selected subnet for hosts without an explicit ip."
   }
 }
 
@@ -207,7 +227,7 @@ resource "aws_instance" "nodes" {
   iam_instance_profile   = local.ssm_instance_profile_name
   key_name               = try(local.aws_config.key_name, null)
 
-  private_ip              = local.assigned_ips_by_host[each.key]
+  private_ip              = local.effective_ip_by_host[each.key]
   associate_public_ip_address = try(local.aws_config.associate_public_ip, false)
   get_password_data       = true
 
@@ -284,7 +304,7 @@ resource "aws_ssm_association" "configure_networking" {
   }
 
   parameters = {
-    StaticIp     = local.assigned_ips_by_host[each.key]
+    StaticIp     = local.effective_ip_by_host[each.key]
     PrefixLength = tostring(local.subnet_prefix_len)
     Gateway      = local.gateway_ip
     DnsList      = join(",", distinct(concat(local.dns_servers, [local.vpc_dns])))
@@ -307,6 +327,12 @@ resource "aws_ssm_association" "configure_networking" {
 
 resource "time_sleep" "wait_for_rename_reboot" {
   create_duration = "90s"
+
+  # Re-create (and re-sleep) whenever the set of rename associations changes so
+  # that configure_networking never races ahead of a reboot for newly added hosts.
+  triggers = {
+    rename_ids = join(",", sort([for k, v in aws_ssm_association.rename_computer : v.association_id]))
+  }
 
   depends_on = [aws_ssm_association.rename_computer]
 }
@@ -333,7 +359,11 @@ resource "aws_ssm_document" "rename_computer" {
         runCommand = [
           "$ErrorActionPreference = 'Stop'",
           "$current = $env:COMPUTERNAME",
-          "if ($current -ne '{{ Hostname }}') { Rename-Computer -NewName '{{ Hostname }}' -Force -Restart } else { Write-Host 'Hostname already set' }"
+          "# Rename without -Restart, then schedule the reboot far enough out that SSM",
+          "# can flush its success status first. -Restart tears the box down immediately",
+          "# and the association reports Failed even though the rename worked.",
+          "# No /f here: a forced shutdown can interrupt in-flight servicing operations.",
+          "if ($current -ne '{{ Hostname }}') { Rename-Computer -NewName '{{ Hostname }}' -Force; Write-Host \"Renamed $current to {{ Hostname }}, rebooting in 15s\"; shutdown.exe /r /t 15 } else { Write-Host 'Hostname already set' }"
         ]
       }
     }]
@@ -385,12 +415,19 @@ resource "aws_ssm_document" "install_windows_features" {
           "$ErrorActionPreference = 'Stop'",
           "# Wait for CBS (component store) to be ready after a reboot",
           "$timeout = 600; $elapsed = 0",
-          "while ($elapsed -lt $timeout) { $cbs = Get-Service -Name TrustedInstaller -ErrorAction SilentlyContinue; if ($cbs) { if ($cbs.Status -ne 'Running') { Start-Service TrustedInstaller -ErrorAction SilentlyContinue }; if ($cbs.Status -eq 'Running') { break } }; Start-Sleep -Seconds 10; $elapsed += 10; Write-Host \"Waiting for TrustedInstaller... ($elapsed s)\" }",
+          "while ($elapsed -lt $timeout) { $cbs = Get-Service -Name TrustedInstaller -ErrorAction SilentlyContinue; if ($cbs) { if ($cbs.Status -ne 'Running') { Start-Service TrustedInstaller -ErrorAction SilentlyContinue }; $cbs.Refresh(); if ($cbs.Status -eq 'Running') { break } }; Start-Sleep -Seconds 10; $elapsed += 10; Write-Host \"Waiting for TrustedInstaller... ($elapsed s)\" }",
           "if ($elapsed -ge $timeout) { throw 'TrustedInstaller did not start within timeout' }",
           "$role = '{{ HostRole }}'",
-          "if ($role -eq 'dhcp_server' -or $role -eq 'domain_controller') { Install-WindowsFeature -Name DHCP,DNS,RSAT-DHCP,RSAT-DNS-Server,RSAT-AD-Tools -IncludeManagementTools }",
-          "if ($role -eq 'agent_client') { Install-WindowsFeature -Name RSAT-AD-PowerShell,RSAT-AD-Tools,RSAT-DNS-Server,RSAT-DHCP -IncludeManagementTools }",
-          "if ($role -eq 'domain_controller') { Install-WindowsFeature -Name AD-Domain-Services -IncludeManagementTools }"
+          "if ($role -eq 'dhcp_server' -or $role -eq 'domain_controller') { $want = @('DHCP','DNS','RSAT-DHCP','RSAT-DNS-Server','RSAT-AD-Tools') }",
+          "if ($role -eq 'agent_client') { $want = @('RSAT-AD-PowerShell','RSAT-AD-Tools','RSAT-DNS-Server','RSAT-DHCP') }",
+          "if ($role -eq 'domain_controller') { $want += 'AD-Domain-Services' }",
+          "# Never force-reboot here: killing TrustedInstaller mid-transaction makes CBS",
+          "# roll the install back, leaving features 'Available' while SSM reports success.",
+          "Install-WindowsFeature -Name $want -IncludeManagementTools | Out-Null",
+          "# Verify the install actually landed rather than trusting the exit code",
+          "$missing = (Get-WindowsFeature -Name $want | Where-Object { $_.InstallState -ne 'Installed' }).Name",
+          "if ($missing) { throw \"Features failed to install: $($missing -join ', ')\" }",
+          "Write-Host \"Features installed: $($want -join ', ')\""
         ]
       }
     }]
@@ -422,6 +459,19 @@ resource "aws_ssm_association" "install_windows_features" {
   wait_for_success_timeout_seconds = 1800
 
   depends_on = [aws_ssm_association.configure_networking]
+}
+
+resource "time_sleep" "wait_for_features_reboot" {
+  create_duration = "120s"
+
+  # Re-create whenever the set of feature-install associations changes so that
+  # bootstrap_domain and join_domain never race ahead of a post-install reboot
+  # for newly added hosts.
+  triggers = {
+    feature_ids = join(",", sort([for k, v in aws_ssm_association.install_windows_features : v.association_id]))
+  }
+
+  depends_on = [aws_ssm_association.install_windows_features]
 }
 
 resource "aws_ssm_document" "bootstrap_domain" {
@@ -483,7 +533,7 @@ resource "aws_ssm_association" "bootstrap_domain" {
   # Forest creation triggers a reboot; allow enough time for reboot + AD startup.
   wait_for_success_timeout_seconds = 1200
 
-  depends_on = [aws_ssm_association.install_windows_features]
+  depends_on = [time_sleep.wait_for_features_reboot]
 }
 
 # ---------------------------------------------------------------------------
@@ -560,6 +610,7 @@ resource "aws_ssm_document" "join_domain" {
       DomainFqdn = { type = "String" }
       AdminUser  = { type = "String" }
       AdminPass  = { type = "String" }
+      DnsList    = { type = "String" }
     }
     mainSteps = [{
       action = "aws:runPowerShellScript"
@@ -575,8 +626,12 @@ resource "aws_ssm_document" "join_domain" {
           "    exit 0",
           "}",
           "",
+          "# Re-assert DNS in case DHCP or EC2Launch reset it after a post-install reboot",
+          "$adapter = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' } | Select-Object -First 1",
+          "if ($adapter) { Set-DnsClientServerAddress -InterfaceIndex $adapter.IfIndex -ServerAddresses ('{{ DnsList }}'.Split(',')); Write-Host 'DNS re-applied: {{ DnsList }}' }",
+          "",
           "# Clear negative DNS cache from any earlier failed lookups",
-          "Clear-DnsClientCache -ErrorAction SilentlyContinue",
+          "try { Clear-DnsClientCache } catch { Write-Host 'DNS cache clear skipped' }",
           "",
           "# Wait for DC SRV records (Add-Computer uses DsGetDcName which requires these)",
           "$srvName = '_ldap._tcp.dc._msdcs.{{ DomainFqdn }}'",
@@ -590,7 +645,7 @@ resource "aws_ssm_document" "join_domain" {
           "        Write-Host \"Waiting for DC SRV record ($srvName)... ($elapsed s)\"",
           "        Start-Sleep 15",
           "        $elapsed += 15",
-          "        Clear-DnsClientCache -ErrorAction SilentlyContinue",
+          "        try { Clear-DnsClientCache } catch {}",
           "    }",
           "}",
           "if ($elapsed -ge $timeout) { throw \"DC SRV record $srvName not found after $${timeout}s\" }",
@@ -605,15 +660,16 @@ resource "aws_ssm_document" "join_domain" {
           "    $attempt++",
           "    try {",
           "        Write-Host \"Domain join attempt $attempt of $maxRetries\"",
-          "        Add-Computer -DomainName '{{ DomainFqdn }}' -Credential $cred -Force -Restart",
-          "        Write-Host 'Domain join succeeded, restarting'",
+          "        Add-Computer -DomainName '{{ DomainFqdn }}' -Credential $cred -Force",
+          "        Write-Host 'Domain join succeeded, scheduling reboot'",
+          "        shutdown.exe /r /f /t 10",
           "        exit 0",
           "    } catch {",
           "        Write-Host \"Attempt $attempt failed: $_\"",
           "        if ($attempt -ge $maxRetries) { throw \"Domain join failed after $maxRetries attempts: $_\" }",
           "        Write-Host 'Sleeping 30s before retry...'",
           "        Start-Sleep 30",
-          "        Clear-DnsClientCache -ErrorAction SilentlyContinue",
+          "        try { Clear-DnsClientCache } catch {}",
           "    }",
           "}"
         ]
@@ -638,6 +694,7 @@ resource "aws_ssm_association" "join_domain" {
     DomainFqdn = local.domain.fqdn
     AdminUser  = local.domain.admin_user
     AdminPass  = local.domain_admin_password
+    DnsList    = join(",", distinct(concat(local.dns_servers, [local.vpc_dns])))
   }
 
   dynamic "output_location" {
@@ -651,7 +708,7 @@ resource "aws_ssm_association" "join_domain" {
   # DNS wait (600s) + LDAP wait (300s) + join retries (150s) + reboot
   wait_for_success_timeout_seconds = 1200
 
-  depends_on = [aws_ssm_association.configure_dns_forwarder]
+  depends_on = [aws_ssm_association.configure_dns_forwarder, time_sleep.wait_for_features_reboot]
 }
 
 resource "aws_ssm_document" "credential_setup" {
@@ -683,8 +740,8 @@ resource "aws_ssm_document" "credential_setup" {
           "# AD user creation — only on the DC (bootstrap host)",
           "if ($isBootstrap) {",
           "  # Complete DHCP post-install: create security groups and authorize in AD",
-          "  netsh dhcp add securitygroups",
-          "  Restart-Service dhcpserver -Force",
+          "  netsh dhcp add securitygroups 2>&1 | Write-Host",
+          "  Restart-Service dhcpserver -Force -ErrorAction SilentlyContinue",
           "  $fqdn = \"$env:COMPUTERNAME.{{ DomainFqdn }}\"",
           "  $ip = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.PrefixOrigin -ne 'WellKnown' } | Select-Object -First 1).IPAddress",
           "  if (-not (Get-DhcpServerInDC | Where-Object { $_.DnsName -eq $fqdn })) { Add-DhcpServerInDC -DnsName $fqdn -IPAddress $ip; Write-Host \"DHCP server $fqdn authorized in AD\" } else { Write-Host \"DHCP server $fqdn already authorized\" }",
@@ -693,8 +750,8 @@ resource "aws_ssm_document" "credential_setup" {
           "  foreach ($grp in @('Domain Users','Remote Management Users','DNSAdmins','DHCP Administrators')) { try { Add-ADGroupMember -Identity $grp -Members $username -ErrorAction Stop; Write-Host \"Added to $grp\" } catch { if ($_.Exception.Message -match 'already a member') { Write-Host \"Already in $grp\" } elseif ($_.Exception.Message -match 'Cannot find an object with identity') { Write-Host \"Group $grp not found, skipping\" } else { throw } } }",
           "} else {",
           "  Write-Host \"Non-DC host — creating DHCP security groups and authorizing in AD\"",
-          "  netsh dhcp add securitygroups",
-          "  Restart-Service dhcpserver -Force",
+          "  netsh dhcp add securitygroups 2>&1 | Write-Host",
+          "  Restart-Service dhcpserver -Force -ErrorAction SilentlyContinue",
           "  Write-Host 'DHCP security groups created (DHCP Administrators, DHCP Users)'",
           "  # Authorize this DHCP server in AD (requires domain cred)",
           "  $secPass = ConvertTo-SecureString '{{ Password }}' -AsPlainText -Force",
@@ -705,6 +762,9 @@ resource "aws_ssm_document" "credential_setup" {
           "  # Add service user to local DHCP Administrators group",
           "  $domainPrefix = '{{ DomainFqdn }}'.Split('.')[0].ToUpper()",
           "  $localAccount = \"$domainPrefix\\{{ Username }}\"",
+          "  # A missing group means the DHCP role never installed - fail fast rather than",
+          "  # retrying 12 times, since no amount of waiting will create it.",
+          "  if (-not (Get-LocalGroup -Name 'DHCP Administrators' -ErrorAction SilentlyContinue)) { throw 'Local group DHCP Administrators does not exist - the DHCP server role is not installed on this host' }",
           "  for ($attempt = 1; $attempt -le 12; $attempt++) { try { Add-LocalGroupMember -Group 'DHCP Administrators' -Member $localAccount -ErrorAction Stop; Write-Host \"Added $localAccount to local DHCP Administrators on $(hostname)\"; break } catch { if ($_.Exception.Message -match 'already a member') { Write-Host \"$localAccount already in local DHCP Administrators\"; break } elseif ($_.Exception.Message -match 'not found|PrincipalNotFound' -and $attempt -lt 12) { Write-Host \"Retry $attempt/12: $localAccount not resolvable yet, waiting 15s...\"; Start-Sleep -Seconds 15 } else { throw } } }",
           "}",
           "",
@@ -772,7 +832,7 @@ resource "aws_ssm_association" "credential_setup" {
     Username     = local.credentials.service_user
     Password     = local.service_user_password
     DomainFqdn   = local.domain.fqdn
-    TrustedHosts = join(",", [for name in local.dhcp_hosts : local.assigned_ips_by_host[name]])
+    TrustedHosts = join(",", [for name in local.dhcp_hosts : local.effective_ip_by_host[name]])
     IsBootstrap  = each.key == local.bootstrap_host ? "true" : "false"
   }
 
@@ -791,6 +851,10 @@ resource "aws_ssm_association" "credential_setup" {
 
 resource "time_sleep" "wait_for_join_reboot" {
   create_duration = "90s"
+
+  triggers = {
+    join_ids = join(",", sort([for k, v in aws_ssm_association.join_domain : v.association_id]))
+  }
 
   depends_on = [aws_ssm_association.join_domain]
 }
@@ -893,8 +957,8 @@ resource "aws_ssm_association" "agent_setup" {
   }
 
   parameters = {
-    TargetServers = join(",", [for name in local.dhcp_hosts : local.assigned_ips_by_host[name]])
-    DcIps         = local.assigned_ips_by_host[local.bootstrap_host]
+    TargetServers = join(",", [for name in local.dhcp_hosts : local.effective_ip_by_host[name]])
+    DcIps         = local.effective_ip_by_host[local.bootstrap_host]
     Username      = local.credentials.service_user
     Password      = local.service_user_password
     DomainFqdn    = local.domain.fqdn

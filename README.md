@@ -74,6 +74,8 @@ When multiple setups share the same subnet, two fields in each config must be un
 
 Allow at least 20 IP slots per setup (2 DHCP servers + 1 agent client + buffer). The `create-setup` script auto-picks a safe offset by scanning all existing configs.
 
+`ip_start_offset` only governs where auto-assignment *begins*; it does not reserve a range. Growing a setup past its slice will run into the next setup's offset, and the `ip_capacity` check fails at plan time if the subnet runs out of room past the offset. Pin IPs with [`make lock-ips`](#ip-pinning) so allocations stay put.
+
 ### Existing setups
 
 | Setup | Domain | IP offset |
@@ -106,7 +108,9 @@ Allow at least 20 IP slots per setup (2 DHCP servers + 1 agent client + buffer).
 8. agent_setup           → CredSSP client, GPO delegation, target list, e2e verification
 ```
 
-Phases are chained via `depends_on` and `time_sleep` resources (90 s / 180 s / 90 s) to accommodate Windows reboots.
+Phases are chained via `depends_on` and `time_sleep` resources (90 s rename / 120 s features / 180 s bootstrap / 90 s join) to accommodate Windows reboots.
+
+Each `time_sleep` keys its `triggers` off the association IDs of the phase before it, so the wait re-runs when hosts are added. Without that, a newly added host would be handed to the next phase while it was still rebooting, and the phase would fail against a machine that was mid-restart.
 
 ## Make Targets
 
@@ -127,9 +131,128 @@ Phases are chained via `depends_on` and `time_sleep` resources (90 s / 180 s / 9
 | `make logs PHASE=x HOST=y RUN=all` | List all runs with timestamps |
 | `make creds [setup]` | RDP credentials for all hosts |
 | `make creds HOST=x [setup]` | RDP credentials for one host |
+| `make lock-ips [setup]` | Pin current IPs into the config (see [IP Pinning](#ip-pinning)) |
 | `make deploy-perf-scripts [setup]` | Upload perf scripts to VMs |
 
 For all targets that accept `[setup]`, pass it as a positional arg (`make apply nstarqa`) or as `SETUP=nstarqa`.
+
+## IP Pinning
+
+**Run `make lock-ips <setup>` after the first apply, and again after adding hosts.** Without it, changing the host list rebuilds the whole setup.
+
+### Why
+
+Hosts without an explicit `ip:` are assigned addresses by index into the list of currently-free subnet IPs. Once a host exists, its own IP counts as "in use" and drops out of that list — so the next plan hands out a *different* address. A changed `private_ip` forces EC2 replacement, and because the assignment is positional, adding or removing one host cascades into new IPs for the others too. The setup gets destroyed and recreated instead of amended, and the multi-phase provisioning restarts from scratch each time.
+
+`make lock-ips` reads the deployed IPs out of Terraform state and writes them into the config as explicit `ip:` fields:
+
+```yaml
+hosts:
+  - name: lab1-dhcp01
+    ip: 172.28.26.225      # ← added by lock-ips
+    role: dhcp_server
+    bootstrap: true
+```
+
+Pinned hosts bypass index assignment entirely, so their IPs are stable no matter what else changes.
+
+### Workflow
+
+```bash
+make apply lab1        # initial deploy
+make lock-ips lab1     # pin the assigned IPs
+git diff config/lab1.yml
+
+# later — adding hosts
+vim config/lab1.yml    # append new hosts (no ip: field)
+make apply lab1        # only the new hosts are created
+make lock-ips lab1     # pin the new hosts too
+```
+
+| After | Run `lock-ips`? | Why |
+|-------|-----------------|-----|
+| Initial `apply` | **Yes** | Pins everything; makes future edits incremental |
+| `apply` that added hosts | **Yes** | New hosts are unpinned until you do |
+| `apply` that only removed hosts | No | Survivors are already pinned |
+| `apply` with no host-list change | No | Nothing new to pin |
+| `redeploy` | **Yes** | Every instance is new |
+| `destroy` | No | Nothing left to pin |
+
+The command is idempotent — re-running it just rewrites the same values.
+
+### Effects
+
+Terraform also skips its subnet-wide ENI scan when nothing needs auto-assignment. That speeds up plans and avoids a race where an ENI belonging to another setup is deleted mid-plan, which otherwise fails with `no matching EC2 Network Interface found`.
+
+One caveat: between adding a host and running `lock-ips`, the new host's IP is still auto-assigned and can shift on a subsequent plan. Pin promptly.
+
+## Adding or Removing Hosts
+
+Provided every existing host is pinned ([IP Pinning](#ip-pinning)), growing or shrinking a setup only touches the machines you changed.
+
+### Steps
+
+```bash
+# 1. Confirm existing hosts are pinned — every entry should have an ip: field
+grep -c 'ip:' config/lab1.yml
+
+# 2. Append the new hosts (no ip: field — they get auto-assigned)
+vim config/lab1.yml
+
+# 3. Dry run. Check for "must be replaced" on any aws_instance — there should be none.
+make plan lab1
+
+# 4. Apply, then pin the new hosts
+make apply lab1
+make lock-ips lab1
+
+# 5. Verify every phase actually succeeded (see the caveat below)
+make progress lab1
+```
+
+Removing a host is the same minus step 4's `lock-ips`: delete its block from the config and apply.
+
+### What actually changes
+
+Adding one `dhcp_server` and one `agent_client` to a healthy 5-host setup plans as:
+
+| Resource | Action | Why |
+|----------|--------|-----|
+| `aws_instance.nodes` (new hosts only) | created | **No existing instance is touched** |
+| All 6 phases for the new hosts | created | They provision from scratch |
+| `credential_setup` on existing DHCP hosts | updated in-place | `TrustedHosts` gained an IP |
+| `agent_setup` on existing clients | updated in-place | `TargetServers` gained an IP |
+| The 3 `time_sleep` resources | replaced | `triggers` changed, so reboot waits re-run |
+
+The in-place updates re-run those scripts on existing machines. They are idempotent, so this is safe — it just adds a few minutes.
+
+### Before you add
+
+| Check | Limit | Symptom if violated |
+|-------|-------|---------------------|
+| Hostname length | **≤ 15 characters** | `rename_computer` fails. `lab1-client01` is 16 and fails; `lab1-clt01` is 10 and works. |
+| Free IPs past `ip_start_offset` | Enough for the new hosts | Plan fails the `ip_capacity` check |
+| EC2 vCPU quota | Account-wide | Instances launch then vanish: `collecting instance settings: empty result` |
+
+The NetBIOS 15-character cap is the easiest one to trip, since role names like `client01` push a prefixed name over on their own. Prefer short forms such as `clt01`.
+
+### Caveat: a clean apply does not mean every phase passed
+
+`Apply complete!` only means Terraform had nothing left to create. An association that failed on an *earlier* run stays in state and is never retried, so its failure is invisible to later applies.
+
+`make progress <setup>` shows the real per-phase status. To retry a specific failed phase, force it to re-run:
+
+```bash
+terraform -chdir=terraform apply \
+  -var="config_file=../config/lab1.yml" \
+  -var-file="secret.lab1.tfvars" \
+  -replace='aws_ssm_association.configure_networking["lab1-dhcp04"]' \
+  --auto-approve
+```
+
+The same `-replace` is needed after editing an SSM document's script: associations reference documents by name, so a content change alone will not re-execute anything.
+
+Individual phases can also fail transiently when a host is slow to finish a reboot. Re-running `make apply` is usually enough, since only the failed association is retried.
 
 ## VM Credentials
 
@@ -205,6 +328,7 @@ scripts/
   progress.sh              # SSM phase progress viewer
   ssm_logs.sh              # S3 log browser
   creds.sh                 # VM credential lookup
+  lock_ips.py              # pin deployed IPs into the config YAML
   deploy_perf_scripts.sh   # upload and run perf scripts via SSM
   bulk_dhcp_load.ps1       # create bulk DHCP scopes/reservations
   performance.ps1          # sample agent process CPU/memory

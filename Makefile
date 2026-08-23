@@ -1,4 +1,4 @@
-SETUP_TARGETS := create-setup validate plan apply destroy redeploy output status progress creds deploy-perf-scripts
+SETUP_TARGETS := create-setup validate plan apply destroy redeploy output status progress creds deploy-perf-scripts lock-ips
 POSITIONAL_SETUP := $(word 2,$(MAKECMDGOALS))
 
 ifeq ($(origin SETUP), undefined)
@@ -28,7 +28,7 @@ $(POSITIONAL_SETUP):
 endif
 endif
 
-.PHONY: help login init ensure-workspace create-setup validate plan apply destroy redeploy output status progress logs creds
+.PHONY: help login init ensure-workspace create-setup validate plan apply destroy redeploy output status progress logs creds lock-ips
 
 help:
 	@echo "Targets:"
@@ -59,6 +59,8 @@ help:
 	@echo "  make creds HOST=name - show credentials for one VM"
 	@echo "  make deploy-perf-scripts [SETUP=name] [SCOPE_COUNT=500] [RESERVATIONS_PER_SCOPE=0]"
 	@echo "                       - upload bulk_dhcp_load.ps1 to DHCP servers and performance.ps1 to agent clients"
+	@echo "  make lock-ips [name] - stamp current IPs from Terraform state into config YAML"
+	@echo "                       - run after initial apply so future adds/removes don't shift existing hosts"
 
 AWS_PROFILE ?= $(shell python3 -c "import yaml; print(yaml.safe_load(open('$(CONFIG)'))['aws']['profile'])" 2>/dev/null || echo "dibya-aws")
 
@@ -128,3 +130,9 @@ DRY_RUN                 ?= 0
 deploy-perf-scripts: ensure-workspace
 	@SETUP=$(SETUP) SCOPE_COUNT=$(SCOPE_COUNT) RESERVATIONS_PER_SCOPE=$(RESERVATIONS_PER_SCOPE) \
 		DRY_RUN=$(DRY_RUN) bash ./scripts/deploy_perf_scripts.sh
+
+# Pin current Terraform-assigned IPs into the config YAML as explicit 'ip:' fields.
+# Run once after initial apply. Subsequent applies will use the pinned IPs so adding
+# or removing other hosts never forces a replacement of existing instances.
+lock-ips: ensure-workspace
+	@python3 scripts/lock_ips.py $(CONFIG) $(TF_DIR)

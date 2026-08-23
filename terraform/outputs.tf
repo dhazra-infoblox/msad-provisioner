@@ -16,7 +16,7 @@ output "dhcp_servers" {
   description = "DHCP server endpoints configured for agent polling"
   value = {
     for name in local.dhcp_hosts :
-    name => local.assigned_ips_by_host[name]
+    name => local.effective_ip_by_host[name]
   }
 }
 
@@ -24,7 +24,7 @@ output "agent_servers" {
   description = "Agent/client hosts and their IPs"
   value = {
     for name in local.agent_hosts :
-    name => local.assigned_ips_by_host[name]
+    name => local.effective_ip_by_host[name]
   }
 }
 
