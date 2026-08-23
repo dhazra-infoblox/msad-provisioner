@@ -29,7 +29,11 @@ admin_password=$(grep -E '^[[:space:]]*admin_password[[:space:]]*=' "$SECRET_TFV
 [ -n "$admin_user" ]    || die "Could not read domain.admin_user from $CONFIG_FILE"
 [ -n "$admin_password" ] || die "Could not read admin_password from $SECRET_TFVARS"
 
-terraform -chdir="$TF_DIR" workspace select "$TF_WORKSPACE" >/dev/null 2>&1 \
+# Exporting TF_WORKSPACE targets the workspace for every terraform call below.
+# `workspace select` cannot be used here: terraform refuses to run it while
+# TF_WORKSPACE is set and exits non-zero, which reads as "not found".
+export TF_WORKSPACE
+terraform -chdir="$TF_DIR" workspace list 2>/dev/null | sed 's/^[* ]*//' | grep -qx "$TF_WORKSPACE" \
   || die "Workspace '$TF_WORKSPACE' not found — run 'make apply SETUP=$TF_WORKSPACE' first"
 
 inventory=$(terraform -chdir="$TF_DIR" output -json host_inventory 2>/dev/null) \

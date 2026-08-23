@@ -39,7 +39,11 @@ if [ -z "${aws_profile:-}" ] || [ -z "${aws_region:-}" ]; then
   exit 1
 fi
 
-terraform -chdir="$TF_DIR" workspace select "$TF_WORKSPACE" >/dev/null 2>&1 \
+# Exporting TF_WORKSPACE is enough to target the workspace for every terraform
+# call below. Do not use `workspace select` here: terraform refuses to run it
+# while TF_WORKSPACE is set and exits non-zero, which reads as "not found".
+export TF_WORKSPACE
+terraform -chdir="$TF_DIR" workspace list 2>/dev/null | sed 's/^[* ]*//' | grep -qx "$TF_WORKSPACE" \
   || { echo "Workspace '$TF_WORKSPACE' not found — run 'make apply SETUP=$TF_WORKSPACE' first"; exit 1; }
 
 if ! terraform -chdir="$TF_DIR" output -json phase_association_ids >/dev/null 2>&1; then
