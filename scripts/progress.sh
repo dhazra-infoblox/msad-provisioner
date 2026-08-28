@@ -46,8 +46,44 @@ export TF_WORKSPACE
 terraform -chdir="$TF_DIR" workspace list 2>/dev/null | sed 's/^[* ]*//' | grep -qx "$TF_WORKSPACE" \
   || { echo "Workspace '$TF_WORKSPACE' not found — run 'make apply SETUP=$TF_WORKSPACE' first"; exit 1; }
 
-if ! terraform -chdir="$TF_DIR" output -json phase_association_ids >/dev/null 2>&1; then
-  echo "No phase_association_ids output found. Run apply first."
+# Association IDs are read out of the state file rather than the
+# phase_association_ids output. Terraform only recomputes outputs at the end of a
+# successful apply, so after a partial failure the output still describes the
+# previous run and every host added since is missing from this table — which is
+# exactly the moment you want to look at it. The state is written as each
+# resource completes, so it sees the whole fleet.
+state_ids() {
+  terraform -chdir="$TF_DIR" show -json 2>/dev/null | python3 -c '
+import json, sys
+
+try:
+    doc = json.load(sys.stdin)
+except ValueError:
+    sys.exit(1)
+
+phases = {}
+for res in doc.get("values", {}).get("root_module", {}).get("resources", []):
+    if res.get("type") != "aws_ssm_association":
+        continue
+    # An association whose create timed out is left tainted, with only its
+    # primary key persisted: association_id is null but id holds the same value.
+    # Preferring id keeps that host reporting its real status — the pending
+    # execution that caused the timeout — instead of looking absent.
+    vals = res.get("values", {})
+    assoc_id = vals.get("association_id") or vals.get("id")
+    index = res.get("index")
+    if index is None:
+        phases[res["name"]] = assoc_id
+    else:
+        phases.setdefault(res["name"], {})[str(index)] = assoc_id
+json.dump(phases, sys.stdout)
+'
+}
+
+all_ids_json=$(state_ids || true)
+
+if [ -z "$all_ids_json" ] || [ "$all_ids_json" = "{}" ]; then
+  echo "No SSM associations in state for workspace '$TF_WORKSPACE'. Run apply first."
   exit 1
 fi
 
@@ -58,8 +94,6 @@ echo "SSM Phase Progress"
 echo "=================="
 printf "%-28s %-16s %-10s %-12s %s\n" "PHASE" "HOST" "STATUS" "DURATION" "COMPLETED_AT"
 echo "--------------------------------------------------------------------------------------------"
-
-all_ids_json=$(terraform -chdir="$TF_DIR" output -json phase_association_ids)
 
 for phase in $PHASE_ORDER; do
   phase_data=$(echo "$all_ids_json" | jq --arg p "$phase" '.[$p] // empty')
@@ -76,6 +110,13 @@ for phase in $PHASE_ORDER; do
   fi
 
   echo "$pairs" | while IFS=$'\t' read -r host assoc_id; do
+    # A host in state with no association_id is one whose association Terraform
+    # started but never finished creating — a timed-out apply leaves it this way.
+    if [ -z "$assoc_id" ] || [ "$assoc_id" = "null" ]; then
+      printf "%-28s %-16s %-10s %-12s %s\n" "$phase" "$host" "- pending" "N/A" "not created"
+      continue
+    fi
+
     exec_json=$(aws --profile "$aws_profile" --region "$aws_region" \
       ssm describe-association-executions \
       --association-id "$assoc_id" \
@@ -174,12 +215,18 @@ all_ids = json.loads(sys.argv[4])
 
 # Get earliest instance launch time
 try:
-    inv = subprocess.run(
-        ["terraform", f"-chdir={tf_dir}", "output", "-json", "host_inventory"],
+    # From state, not the host_inventory output, for the same reason as the
+    # association IDs above: a partial apply leaves the output a run behind.
+    show = subprocess.run(
+        ["terraform", f"-chdir={tf_dir}", "show", "-json"],
         capture_output=True, text=True
     )
-    hosts = json.loads(inv.stdout)
-    instance_ids = [h["instance_id"] for h in hosts.values()]
+    doc = json.loads(show.stdout)
+    instance_ids = [
+        r["values"]["id"]
+        for r in doc.get("values", {}).get("root_module", {}).get("resources", [])
+        if r.get("type") == "aws_instance" and r.get("values", {}).get("id")
+    ]
 
     result = subprocess.run(
         ["aws", "ec2", "describe-instances",
