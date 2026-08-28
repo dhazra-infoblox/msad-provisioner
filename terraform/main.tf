@@ -86,6 +86,14 @@ locals {
   pinned_ip_by_host = { for name, h in local.host_map : name => h.ip if can(h.ip) }
   unpinned_names    = [for name in local.ordered_host_names : name if !can(local.host_map[name].ip)]
 
+  # Copy-pasting a host block carries its `ip:` along, so two hosts can end up
+  # pinned to the same address. AWS only rejects that at RunInstances time, i.e.
+  # after the rest of the fleet is already built, so it is caught in the plan.
+  pinned_ips_duplicated = [
+    for ip in distinct(values(local.pinned_ip_by_host)) : ip
+    if length([for name, pinned in local.pinned_ip_by_host : name if pinned == ip]) > 1
+  ]
+
   # When every host is pinned there is nothing to auto-assign, so the subnet ENI
   # scan below is skipped entirely. That avoids a race where an ENI belonging to
   # another setup is deleted between the list and the per-ENI read.
@@ -200,6 +208,7 @@ resource "terraform_data" "validation" {
     roles     = local.host_roles
     bootstrap = local.bootstrap_host
     netbios   = local.netbios_name
+    pinned    = local.pinned_ip_by_host
   }
 
   lifecycle {
@@ -259,6 +268,19 @@ resource "terraform_data" "validation" {
     precondition {
       condition     = !local.validate_hostnames || (length(local.netbios_name) > 0 && length(local.netbios_name) <= local.netbios_max_length && can(regex("^[A-Za-z0-9-]+$", local.netbios_name)))
       error_message = "domain.netbios must be 1-${local.netbios_max_length} characters of letters, digits or hyphens, got \"${local.netbios_name}\"."
+    }
+
+    precondition {
+      condition = length(local.pinned_ips_duplicated) == 0
+      error_message = join("", [
+        "Duplicate explicit ip: values in config.hosts: ",
+        join("; ", [
+          for ip in local.pinned_ips_duplicated :
+          "${ip} is pinned to ${join(", ", sort([for name, pinned in local.pinned_ip_by_host : name if pinned == ip]))}"
+        ]),
+        ". Each host needs its own address — drop the ip: line to have one auto-assigned, ",
+        "then run `make lock-ips` after the apply to pin it.",
+      ])
     }
 
     precondition {
