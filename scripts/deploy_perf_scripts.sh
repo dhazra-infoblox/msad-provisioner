@@ -2,8 +2,8 @@
 # deploy_perf_scripts.sh
 #
 # Uploads performance testing scripts to S3 and deploys them via SSM:
-#   - scripts/bulk_dhcp_load.ps1  → all DHCP servers (C:\ProgramData\msad-agent\)
-#   - scripts/performance.ps1     → all agent clients (C:\Users\MSADAgent\)
+#   - scripts/bulk_dhcp_load.ps1  → all server hosts, role srv (C:\ProgramData\msad-agent\)
+#   - scripts/performance.ps1     → all agent clients, role clt (C:\Users\MSADAgent\)
 #
 # Usage:
 #   SETUP=nstarqa bash scripts/deploy_perf_scripts.sh
@@ -144,11 +144,11 @@ if [ -z "$INVENTORY_JSON" ] || [ "$INVENTORY_JSON" = "null" ]; then
 fi
 
 # Parse instance IDs by role
-DHCP_INSTANCES=$(python3 -c "
+SERVER_INSTANCES=$(python3 -c "
 import json, sys
 inv = json.load(sys.stdin)
 for name, h in inv.items():
-    if h.get('role') == 'dhcp_server':
+    if h.get('role') in ('srv', 'dhcp_server'):
         print(f\"{name}={h['instance_id']}\")
 " <<< "$INVENTORY_JSON")
 
@@ -156,18 +156,18 @@ AGENT_INSTANCES=$(python3 -c "
 import json, sys
 inv = json.load(sys.stdin)
 for name, h in inv.items():
-    if h.get('role') == 'agent_client':
+    if h.get('role') in ('clt', 'agent_client'):
         print(f\"{name}={h['instance_id']}\")
 " <<< "$INVENTORY_JSON")
 
-if [ -z "$DHCP_INSTANCES" ]; then
-  warn "No dhcp_server hosts found in inventory."
+if [ -z "$SERVER_INSTANCES" ]; then
+  warn "No server hosts (role srv) found in inventory."
 fi
 if [ -z "$AGENT_INSTANCES" ]; then
-  warn "No agent_client hosts found in inventory."
+  warn "No agent client hosts (role clt) found in inventory."
 fi
 
-log "DHCP servers: $(echo "$DHCP_INSTANCES" | xargs)"
+log "Server hosts: $(echo "$SERVER_INSTANCES" | xargs)"
 log "Agent clients: $(echo "$AGENT_INSTANCES" | xargs)"
 
 # ── Upload scripts to S3 ───────────────────────────────────────────────────────
@@ -186,12 +186,12 @@ fi
 
 log "Scripts uploaded to s3://$S3_BUCKET/$SCRIPT_S3_PREFIX/"
 
-# ── Deploy bulk_dhcp_load.ps1 to each DHCP server ─────────────────────────────
+# ── Deploy bulk_dhcp_load.ps1 to each server host ─────────────────────────────
 log ""
-log "=== Deploying bulk_dhcp_load.ps1 to DHCP servers ==="
+log "=== Deploying bulk_dhcp_load.ps1 to server hosts ==="
 
-DHCP_CMD_IDS=()
-DHCP_INSTANCE_IDS=()
+SERVER_CMD_IDS=()
+SERVER_INSTANCE_IDS=()
 
 while IFS='=' read -r host_name instance_id; do
   [ -z "$host_name" ] && continue
@@ -205,10 +205,10 @@ while IFS='=' read -r host_name instance_id; do
   CMD_JSON='["$dest = \"'"${DHCP_SCRIPT_PATH//\\/\\\\\\\\}"'\"","New-Item -Path (Split-Path $dest -Parent) -ItemType Directory -Force | Out-Null","$url = (Get-STSCallerIdentity | Out-Null; $null)","& \"C:\\Program Files\\Amazon\\AWSCLIV2\\aws.exe\" s3 cp s3://'"$S3_BUCKET/$SCRIPT_S3_PREFIX"'/bulk_dhcp_load.ps1 $dest","Write-Host \"Deployed bulk_dhcp_load.ps1 to $dest\"","Write-Host \"Run: powershell -ExecutionPolicy Bypass -File $dest -ScopeCount '"$SCOPE_COUNT"' -ReservationsPerScope '"$RESERVATIONS_PER_SCOPE"'\""]'
 
   cmd_id=$(ssm_send "$instance_id" "deploy bulk_dhcp_load.ps1 to $host_name" "$CMD_JSON")
-  DHCP_CMD_IDS+=("$cmd_id")
-  DHCP_INSTANCE_IDS+=("$instance_id:$host_name")
+  SERVER_CMD_IDS+=("$cmd_id")
+  SERVER_INSTANCE_IDS+=("$instance_id:$host_name")
 
-done <<< "$DHCP_INSTANCES"
+done <<< "$SERVER_INSTANCES"
 
 # ── Deploy performance.ps1 to each agent client ────────────────────────────────
 log ""
@@ -236,9 +236,9 @@ log "=== Polling deployment status ==="
 
 all_ok=true
 
-for i in "${!DHCP_CMD_IDS[@]}"; do
-  cmd_id="${DHCP_CMD_IDS[$i]}"
-  instance_info="${DHCP_INSTANCE_IDS[$i]}"
+for i in "${!SERVER_CMD_IDS[@]}"; do
+  cmd_id="${SERVER_CMD_IDS[$i]}"
+  instance_info="${SERVER_INSTANCE_IDS[$i]}"
   instance_id="${instance_info%%:*}"
   label="${instance_info#*:} (bulk_dhcp_load.ps1)"
   poll_command "$cmd_id" "$instance_id" "$label" || all_ok=false
@@ -257,7 +257,7 @@ log ""
 log "=== Deployment Summary ==="
 log "Scripts staged at: s3://$S3_BUCKET/$SCRIPT_S3_PREFIX/"
 log ""
-log "On each DHCP server:"
+log "On each server host:"
 log "  Path : $DHCP_SCRIPT_PATH"
 log "  Run  : powershell -ExecutionPolicy Bypass -File \"$DHCP_SCRIPT_PATH\" -ScopeCount $SCOPE_COUNT -ReservationsPerScope $RESERVATIONS_PER_SCOPE"
 log ""

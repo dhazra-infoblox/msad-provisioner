@@ -3,7 +3,7 @@ output "host_inventory" {
   value = {
     for name, vm in aws_instance.nodes :
     name => {
-      role        = local.host_map[name].role
+      role        = local.host_roles[name]
       bootstrap   = try(local.host_map[name].bootstrap, false)
       instance_id = vm.id
       private_ip  = vm.private_ip
@@ -12,18 +12,18 @@ output "host_inventory" {
   }
 }
 
-output "dhcp_servers" {
-  description = "DHCP server endpoints configured for agent polling"
+output "server_hosts" {
+  description = "Server hosts (AD/DNS/DHCP) and their IPs — the endpoints the agent polls"
   value = {
-    for name in local.dhcp_hosts :
+    for name in local.server_hosts :
     name => local.effective_ip_by_host[name]
   }
 }
 
-output "agent_servers" {
-  description = "Agent/client hosts and their IPs"
+output "client_hosts" {
+  description = "Agent client hosts and their IPs"
   value = {
-    for name in local.agent_hosts :
+    for name in local.client_hosts :
     name => local.effective_ip_by_host[name]
   }
 }

@@ -23,15 +23,42 @@ locals {
 
   rdp_key_path = trimspace(var.key_pair_pem_path)
 
-  allowed_roles      = ["dhcp_server", "agent_client", "domain_controller"]
-  host_map           = { for h in local.hosts : h.name => h }
+  # Roles name what the host *is*, not one of the services it happens to run:
+  # a "srv" host carries AD, DNS and DHCP together. The longer names this tool
+  # started with are still accepted as aliases so configs written against the
+  # old schema keep working without an edit.
+  role_aliases = {
+    dhcp_server       = "srv"
+    agent_client      = "clt"
+    domain_controller = "dc"
+  }
+  allowed_roles = ["srv", "clt", "dc"]
+
+  # tostring(): a host named `01` or `12345` decodes out of YAML as a number,
+  # and length() rejects a number with an unhelpful type error long before the
+  # validation preconditions get a chance to explain the real problem.
+  config_host_names = [for h in local.hosts : tostring(h.name)]
+
+  # Keyed off distinct names so a duplicated host name lands on the validation
+  # precondition below instead of failing here with "Duplicate object key".
+  host_map = {
+    for name in distinct(local.config_host_names) :
+    name => [for h in local.hosts : h if tostring(h.name) == name][0]
+  }
+  host_roles         = { for name, h in local.host_map : name => try(local.role_aliases[h.role], h.role, "<missing>") }
   ordered_host_names = sort(keys(local.host_map))
 
-  bootstrap_hosts = [for h in local.hosts : h.name if try(h.bootstrap, false)]
+  bootstrap_hosts = [for h in local.hosts : tostring(h.name) if try(h.bootstrap, false)]
   bootstrap_host  = length(local.bootstrap_hosts) == 1 ? local.bootstrap_hosts[0] : ""
 
-  dhcp_hosts  = [for h in local.hosts : h.name if h.role == "dhcp_server"]
-  agent_hosts = [for h in local.hosts : h.name if h.role == "agent_client"]
+  # Kept in config order (not sorted) so the IP lists handed to TrustedHosts and
+  # the agent target list stay byte-identical across plans.
+  #
+  # A "dc" host runs DNS and DHCP too, so it belongs in this list alongside the
+  # member servers: it is a host the agent manages, not a different kind of thing.
+  server_host_roles = ["srv", "dc"]
+  server_hosts      = [for name in distinct(local.config_host_names) : name if contains(local.server_host_roles, local.host_roles[name])]
+  client_hosts      = [for name in distinct(local.config_host_names) : name if local.host_roles[name] == "clt"]
 
   subnet_prefix_len = tonumber(split("/", data.aws_subnet.selected.cidr_block)[1])
   host_space        = pow(2, 32 - local.subnet_prefix_len)
@@ -74,6 +101,37 @@ locals {
   dns_servers = length(try(local.network.dns_servers, [])) > 0 ? local.network.dns_servers : [local.primary_dns]
   vpc_dns     = cidrhost(data.aws_vpc.selected.cidr_block, 2)
 
+  # Windows caps a computer (NetBIOS) name at 15 characters. A longer name only
+  # blows up in the rename phase, i.e. after the instance already exists, so the
+  # rules below are enforced with preconditions on terraform_data.validation
+  # (which fail `terraform plan`) instead of `check` blocks (which only warn).
+  hostname_max_length = 15
+  netbios_max_length  = 15
+
+  # Escape hatch for setups deployed before these rules existed: an over-length
+  # name can only be corrected by replacing the instance, and that should be a
+  # deliberate act, not something a routine plan forces on you. The structural
+  # rules — roles, duplicates, bootstrap count, IP capacity — are never
+  # bypassable, since a plan that violates them cannot succeed anyway.
+  validate_hostnames = try(tobool(local.config.validation.hostnames), true)
+
+  hosts_too_long   = [for n in local.config_host_names : n if length(n) > local.hostname_max_length]
+  hosts_all_digits = [for n in local.config_host_names : n if can(regex("^[0-9]+$", n))]
+  hosts_bad_chars = [
+    for n in local.config_host_names : n
+    if !can(regex("^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$", n))
+  ]
+  hosts_duplicated = [
+    for n in distinct(local.config_host_names) : n
+    if length([for m in local.config_host_names : m if m == n]) > 1
+  ]
+  hosts_bad_roles = [
+    for name, h in local.host_map : "${name} (role: ${try(h.role, "<missing>")})"
+    if !contains(local.allowed_roles, local.host_roles[name])
+  ]
+
+  netbios_name = trimspace(try(local.domain.netbios, ""))
+
   common_tags = merge(var.default_tags, try(local.aws_config.tags, {}), {
     environment = try(local.aws_config.environment, "dev")
   })
@@ -83,7 +141,7 @@ locals {
   service_user_password = var.service_password
 
   use_existing_instance_profile = try(local.aws_config.instance_profile_name, "") != ""
-  ssm_instance_profile_name = local.use_existing_instance_profile ? local.aws_config.instance_profile_name : aws_iam_instance_profile.ssm_instance_profile[0].name
+  ssm_instance_profile_name     = local.use_existing_instance_profile ? local.aws_config.instance_profile_name : aws_iam_instance_profile.ssm_instance_profile[0].name
 }
 
 provider "aws" {
@@ -115,31 +173,87 @@ data "aws_network_interface" "subnet_eni" {
   id       = each.key
 }
 
-check "has_hosts" {
-  assert {
-    condition     = length(local.hosts) > 0
-    error_message = "config.hosts must include at least one host."
-  }
-}
+# ---------------------------------------------------------------------------
+# Config validation
+#
+# Every rule here is a precondition rather than a `check` assertion: a failed
+# check is only a warning, so a 16-character hostname would still get applied
+# and fail hours later inside the rename phase. Preconditions abort the plan.
+# ---------------------------------------------------------------------------
 
-check "valid_host_roles" {
-  assert {
-    condition     = alltrue([for h in local.hosts : contains(local.allowed_roles, h.role)])
-    error_message = "All host roles must be one of: dhcp_server, agent_client, domain_controller."
+resource "terraform_data" "validation" {
+  # Feeding the validated values in as input keeps this resource in the plan
+  # whenever the host list changes, so the rules below can never go stale.
+  input = {
+    hosts     = local.config_host_names
+    roles     = local.host_roles
+    bootstrap = local.bootstrap_host
+    netbios   = local.netbios_name
   }
-}
 
-check "single_bootstrap" {
-  assert {
-    condition     = length(local.bootstrap_hosts) == 1
-    error_message = "Exactly one host must set bootstrap: true for forest creation."
-  }
-}
+  lifecycle {
+    precondition {
+      condition     = length(local.hosts) > 0
+      error_message = "config.hosts must include at least one host."
+    }
 
-check "ip_capacity" {
-  assert {
-    condition     = length(local.available_ips) >= length(local.unpinned_names)
-    error_message = "Not enough available IP addresses in selected subnet for hosts without an explicit ip."
+    precondition {
+      condition     = length(local.hosts_duplicated) == 0
+      error_message = "Duplicate host names in config.hosts: ${join(", ", local.hosts_duplicated)}. Host names must be unique."
+    }
+
+    precondition {
+      condition = !local.validate_hostnames || length(local.hosts_too_long) == 0
+      error_message = join("", [
+        "Host name(s) exceed the ${local.hostname_max_length}-character Windows computer name limit: ",
+        join(", ", [for n in local.hosts_too_long : "${n} (${length(n)} chars)"]),
+        ". Shorten the prefix and use the srvNN/cltNN forms — e.g. sw-srv01, sw-clt01 — instead of stgwin-dhcp01. ",
+        "Renaming an existing host replaces its instance, so to keep planning a legacy setup meanwhile set validation.hostnames: false in the config.",
+      ])
+    }
+
+    precondition {
+      condition = !local.validate_hostnames || length(local.hosts_bad_chars) == 0
+      error_message = join("", [
+        "Host name(s) contain characters that are invalid in a Windows computer name or DNS label: ",
+        join(", ", local.hosts_bad_chars),
+        ". Use letters, digits and inner hyphens only (no underscores, dots, or leading/trailing hyphen).",
+      ])
+    }
+
+    precondition {
+      condition     = !local.validate_hostnames || length(local.hosts_all_digits) == 0
+      error_message = "Host name(s) cannot be all digits: ${join(", ", local.hosts_all_digits)}."
+    }
+
+    precondition {
+      condition = length(local.hosts_bad_roles) == 0
+      error_message = join("", [
+        "Invalid host role(s): ", join(", ", local.hosts_bad_roles),
+        ". Valid roles are ", join(", ", local.allowed_roles),
+        " (legacy aliases dhcp_server/agent_client/domain_controller are also accepted).",
+      ])
+    }
+
+    precondition {
+      condition     = length(local.bootstrap_hosts) == 1
+      error_message = "Exactly one host must set bootstrap: true for forest creation, found ${length(local.bootstrap_hosts)}: ${join(", ", local.bootstrap_hosts)}."
+    }
+
+    precondition {
+      condition     = local.bootstrap_host == "" || local.host_roles[local.bootstrap_host] != "clt"
+      error_message = "The bootstrap host ${local.bootstrap_host} has role clt. It is promoted to a domain controller, so it must be dc (preferred) or srv."
+    }
+
+    precondition {
+      condition     = !local.validate_hostnames || (length(local.netbios_name) > 0 && length(local.netbios_name) <= local.netbios_max_length && can(regex("^[A-Za-z0-9-]+$", local.netbios_name)))
+      error_message = "domain.netbios must be 1-${local.netbios_max_length} characters of letters, digits or hyphens, got \"${local.netbios_name}\"."
+    }
+
+    precondition {
+      condition     = length(local.available_ips) >= length(local.unpinned_names)
+      error_message = "Not enough available IP addresses in selected subnet for hosts without an explicit ip."
+    }
   }
 }
 
@@ -148,8 +262,8 @@ check "ip_capacity" {
 # ---------------------------------------------------------------------------
 
 locals {
-  ssm_log_bucket = try(local.config.ssm_logs.s3_bucket, "")
-  ssm_log_prefix = try(local.config.ssm_logs.s3_prefix, "ssm-logs")
+  ssm_log_bucket   = try(local.config.ssm_logs.s3_bucket, "")
+  ssm_log_prefix   = try(local.config.ssm_logs.s3_prefix, "ssm-logs")
   ssm_logs_enabled = local.ssm_log_bucket != ""
 }
 
@@ -227,9 +341,9 @@ resource "aws_instance" "nodes" {
   iam_instance_profile   = local.ssm_instance_profile_name
   key_name               = try(local.aws_config.key_name, null)
 
-  private_ip              = local.effective_ip_by_host[each.key]
+  private_ip                  = local.effective_ip_by_host[each.key]
   associate_public_ip_address = try(local.aws_config.associate_public_ip, false)
-  get_password_data       = true
+  get_password_data           = true
 
   root_block_device {
     volume_size = lookup(each.value, "disk_gb", 60)
@@ -247,7 +361,7 @@ resource "aws_instance" "nodes" {
 
   tags = merge(local.common_tags, {
     Name      = each.key
-    HostRole  = each.value.role
+    HostRole  = local.host_roles[each.key]
     Bootstrap = tostring(try(each.value.bootstrap, false))
   })
 }
@@ -261,10 +375,10 @@ resource "aws_ssm_document" "configure_networking" {
     schemaVersion = "2.2"
     description   = "Disable DHCP and set static networking"
     parameters = {
-      StaticIp = { type = "String" }
+      StaticIp     = { type = "String" }
       PrefixLength = { type = "String" }
-      Gateway  = { type = "String" }
-      DnsList  = { type = "String" }
+      Gateway      = { type = "String" }
+      DnsList      = { type = "String" }
     }
     mainSteps = [{
       action = "aws:runPowerShellScript"
@@ -418,9 +532,9 @@ resource "aws_ssm_document" "install_windows_features" {
           "while ($elapsed -lt $timeout) { $cbs = Get-Service -Name TrustedInstaller -ErrorAction SilentlyContinue; if ($cbs) { if ($cbs.Status -ne 'Running') { Start-Service TrustedInstaller -ErrorAction SilentlyContinue }; $cbs.Refresh(); if ($cbs.Status -eq 'Running') { break } }; Start-Sleep -Seconds 10; $elapsed += 10; Write-Host \"Waiting for TrustedInstaller... ($elapsed s)\" }",
           "if ($elapsed -ge $timeout) { throw 'TrustedInstaller did not start within timeout' }",
           "$role = '{{ HostRole }}'",
-          "if ($role -eq 'dhcp_server' -or $role -eq 'domain_controller') { $want = @('DHCP','DNS','RSAT-DHCP','RSAT-DNS-Server','RSAT-AD-Tools') }",
-          "if ($role -eq 'agent_client') { $want = @('RSAT-AD-PowerShell','RSAT-AD-Tools','RSAT-DNS-Server','RSAT-DHCP') }",
-          "if ($role -eq 'domain_controller') { $want += 'AD-Domain-Services' }",
+          "if ($role -eq 'srv' -or $role -eq 'dc') { $want = @('DHCP','DNS','RSAT-DHCP','RSAT-DNS-Server','RSAT-AD-Tools') }",
+          "if ($role -eq 'clt') { $want = @('RSAT-AD-PowerShell','RSAT-AD-Tools','RSAT-DNS-Server','RSAT-DHCP') }",
+          "if ($role -eq 'dc') { $want += 'AD-Domain-Services' }",
           "# Never force-reboot here: killing TrustedInstaller mid-transaction makes CBS",
           "# roll the install back, leaving features 'Available' while SSM reports success.",
           "Install-WindowsFeature -Name $want -IncludeManagementTools | Out-Null",
@@ -445,7 +559,7 @@ resource "aws_ssm_association" "install_windows_features" {
   }
 
   parameters = {
-    HostRole = local.host_map[each.key].role
+    HostRole = local.host_roles[each.key]
   }
 
   dynamic "output_location" {
@@ -483,10 +597,10 @@ resource "aws_ssm_document" "bootstrap_domain" {
     schemaVersion = "2.2"
     description   = "Create forest/domain on bootstrap host"
     parameters = {
-      DomainFqdn     = { type = "String" }
-      DomainNetbios  = { type = "String" }
-      SafeModePass   = { type = "String" }
-      AdminPass      = { type = "String" }
+      DomainFqdn    = { type = "String" }
+      DomainNetbios = { type = "String" }
+      SafeModePass  = { type = "String" }
+      AdminPass     = { type = "String" }
     }
     mainSteps = [{
       action = "aws:runPowerShellScript"
@@ -773,7 +887,7 @@ resource "aws_ssm_document" "credential_setup" {
           "$localAccount = \"$domainPrefix\\$username\"",
           "if (-not $isBootstrap) { for ($attempt = 1; $attempt -le 12; $attempt++) { try { Add-LocalGroupMember -Group 'Remote Management Users' -Member $localAccount -ErrorAction Stop; Write-Host \"Added $localAccount to local Remote Management Users on $(hostname)\"; break } catch { if ($_.Exception.Message -match 'already a member') { Write-Host \"$localAccount already in local Remote Management Users\"; break } elseif ($_.Exception.Message -match 'not found|PrincipalNotFound' -and $attempt -lt 12) { Write-Host \"Retry $attempt/12: $localAccount not resolvable yet, waiting 15s...\"; Start-Sleep -Seconds 15 } else { throw } } } } else { Write-Host 'DC host — Remote Management Users is an AD group, already configured' }",
           "",
-          "# CredSSP, firewall, TrustedHosts — all DHCP servers",
+          "# CredSSP, firewall, TrustedHosts — all server hosts",
           "Enable-WSManCredSSP -Role Server -Force",
           "Set-NetFirewallRule -Name 'WINRM-HTTP-In-TCP-PUBLIC' -RemoteAddress Any",
           "Set-Item WSMan:\\localhost\\Client\\TrustedHosts -Value '{{ TrustedHosts }}' -Force",
@@ -818,7 +932,7 @@ resource "aws_ssm_document" "credential_setup" {
 
 resource "aws_ssm_association" "credential_setup" {
   for_each = {
-    for name, vm in aws_instance.nodes : name => vm if local.host_map[name].role == "dhcp_server" || name == local.bootstrap_host
+    for name, vm in aws_instance.nodes : name => vm if contains(local.server_hosts, name) || name == local.bootstrap_host
   }
 
   name = aws_ssm_document.credential_setup.name
@@ -832,7 +946,7 @@ resource "aws_ssm_association" "credential_setup" {
     Username     = local.credentials.service_user
     Password     = local.service_user_password
     DomainFqdn   = local.domain.fqdn
-    TrustedHosts = join(",", [for name in local.dhcp_hosts : local.effective_ip_by_host[name]])
+    TrustedHosts = join(",", [for name in local.server_hosts : local.effective_ip_by_host[name]])
     IsBootstrap  = each.key == local.bootstrap_host ? "true" : "false"
   }
 
@@ -866,7 +980,7 @@ resource "aws_ssm_document" "agent_setup" {
 
   content = jsonencode({
     schemaVersion = "2.2"
-    description   = "Configure agent client: CredSSP, GPO delegation, RSAT, targets"
+    description   = "Configure agent client: CredSSP, GPO delegation, RSAT, target servers"
     parameters = {
       TargetServers = { type = "String" }
       DcIps         = { type = "String" }
@@ -881,7 +995,7 @@ resource "aws_ssm_document" "agent_setup" {
         runCommand = [
           "$ErrorActionPreference = 'Stop'",
           "",
-          "# --- CredSSP Client (DC + DHCP targets) ---",
+          "# --- CredSSP Client (DC + managed server targets) ---",
           "$dcIps = '{{ DcIps }}'.Split(',')",
           "$targetIps = '{{ TargetServers }}'.Split(',')",
           "$allIps = ($dcIps + $targetIps) | Select-Object -Unique",
@@ -926,8 +1040,8 @@ resource "aws_ssm_document" "agent_setup" {
           "$path = 'C:\\ProgramData\\msad-agent'",
           "New-Item -Path $path -ItemType Directory -Force | Out-Null",
           "$targets = '{{ TargetServers }}'.Split(',')",
-          "$targets | ConvertTo-Json | Set-Content -Path \"$path\\dhcp-targets.json\"",
-          "Write-Host \"Agent targets written to $path\\dhcp-targets.json\"",
+          "$targets | ConvertTo-Json | Set-Content -Path \"$path\\server-targets.json\"",
+          "Write-Host \"Agent targets written to $path\\server-targets.json\"",
           "",
           "# --- Verify CredSSP with Invoke-Command ---",
           "$secPass = ConvertTo-SecureString '{{ Password }}' -AsPlainText -Force",
@@ -946,7 +1060,7 @@ resource "aws_ssm_document" "agent_setup" {
 
 resource "aws_ssm_association" "agent_setup" {
   for_each = {
-    for name, vm in aws_instance.nodes : name => vm if local.host_map[name].role == "agent_client"
+    for name, vm in aws_instance.nodes : name => vm if local.host_roles[name] == "clt"
   }
 
   name = aws_ssm_document.agent_setup.name
@@ -957,7 +1071,7 @@ resource "aws_ssm_association" "agent_setup" {
   }
 
   parameters = {
-    TargetServers = join(",", [for name in local.dhcp_hosts : local.effective_ip_by_host[name]])
+    TargetServers = join(",", [for name in local.server_hosts : local.effective_ip_by_host[name]])
     DcIps         = local.effective_ip_by_host[local.bootstrap_host]
     Username      = local.credentials.service_user
     Password      = local.service_user_password
