@@ -433,7 +433,13 @@ resource "aws_ssm_document" "configure_networking" {
           "Set-DnsClientServerAddress -InterfaceIndex $ifIndex -ServerAddresses $dns",
           "if (-not (Get-NetRoute -DestinationPrefix '169.254.169.254/32' -ErrorAction SilentlyContinue)) { New-NetRoute -DestinationPrefix '169.254.169.254/32' -InterfaceIndex $ifIndex -NextHop '{{ Gateway }}' -RouteMetric 10 -ErrorAction SilentlyContinue }",
           "Set-NetConnectionProfile -InterfaceIndex $ifIndex -NetworkCategory Private -ErrorAction SilentlyContinue",
-          "Enable-NetFirewallRule -Name 'FPS-ICMP4-ERQ-In' -ErrorAction SilentlyContinue"
+          "# Enabling ICMP echo is a convenience, so this stays best-effort. It cannot",
+          "# rely on -ErrorAction to get there: right after the address change the",
+          "# NetSecurity module intermittently fails to autoload, and a module-load",
+          "# failure is not an ordinary cmdlet error — -ErrorAction does not suppress it,",
+          "# so under $ErrorActionPreference = 'Stop' it aborts the whole script and the",
+          "# host fails configure_networking having already been configured correctly.",
+          "foreach ($attempt in 1..3) { try { Import-Module NetSecurity -ErrorAction Stop; Enable-NetFirewallRule -Name 'FPS-ICMP4-ERQ-In' -ErrorAction Stop; Write-Host 'ICMP echo request rule enabled'; break } catch { Write-Host \"Attempt $attempt to enable the ICMP rule failed: $($_.Exception.Message)\"; if ($attempt -lt 3) { Start-Sleep -Seconds 5 } }}"
         ]
       }
     }]
