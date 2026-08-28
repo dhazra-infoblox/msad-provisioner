@@ -475,6 +475,16 @@ resource "aws_ssm_association" "configure_networking" {
   # networking so no subsequent reboot can reset DNS settings.
   wait_for_success_timeout_seconds = 600
 
+  # Replacing an instance would otherwise leave this association in place and
+  # merely update its targets. An update does not honour
+  # wait_for_success_timeout_seconds — it returns as soon as the API call lands —
+  # so the phase ordering collapses and State Manager re-fires every phase at once
+  # against a host that has not been renamed or rebooted yet. Forcing a replace
+  # puts each phase back through create, which does wait for success.
+  lifecycle {
+    replace_triggered_by = [aws_instance.nodes[each.key]]
+  }
+
   depends_on = [time_sleep.wait_for_rename_reboot]
 }
 
@@ -547,6 +557,16 @@ resource "aws_ssm_association" "rename_computer" {
 
   # Runs first on DHCP (SSM/DNS still work). Reboot happens here.
   wait_for_success_timeout_seconds = 300
+
+  # Replacing an instance would otherwise leave this association in place and
+  # merely update its targets. An update does not honour
+  # wait_for_success_timeout_seconds — it returns as soon as the API call lands —
+  # so the phase ordering collapses and State Manager re-fires every phase at once
+  # against a host that has not been renamed or rebooted yet. Forcing a replace
+  # puts each phase back through create, which does wait for success.
+  lifecycle {
+    replace_triggered_by = [aws_instance.nodes[each.key]]
+  }
 }
 
 resource "aws_ssm_document" "install_windows_features" {
@@ -610,6 +630,16 @@ resource "aws_ssm_association" "install_windows_features" {
   }
 
   wait_for_success_timeout_seconds = 1800
+
+  # Replacing an instance would otherwise leave this association in place and
+  # merely update its targets. An update does not honour
+  # wait_for_success_timeout_seconds — it returns as soon as the API call lands —
+  # so the phase ordering collapses and State Manager re-fires every phase at once
+  # against a host that has not been renamed or rebooted yet. Forcing a replace
+  # puts each phase back through create, which does wait for success.
+  lifecycle {
+    replace_triggered_by = [aws_instance.nodes[each.key]]
+  }
 
   depends_on = [aws_ssm_association.configure_networking]
 }
@@ -686,6 +716,12 @@ resource "aws_ssm_association" "bootstrap_domain" {
   # Forest creation triggers a reboot; allow enough time for reboot + AD startup.
   wait_for_success_timeout_seconds = 1200
 
+  # No replace_triggered_by here, unlike the per-host associations:
+  # replace_triggered_by only accepts a whole resource, count.index or each.key,
+  # and aws_instance.nodes as a whole would re-run forest creation every time any
+  # unrelated host is replaced. Losing the bootstrap host destroys the domain and
+  # needs a full redeploy regardless, so there is nothing to order around here.
+
   depends_on = [time_sleep.wait_for_features_reboot]
 }
 
@@ -739,6 +775,12 @@ resource "aws_ssm_association" "configure_dns_forwarder" {
   }
 
   wait_for_success_timeout_seconds = 120
+
+  # No replace_triggered_by here, unlike the per-host associations:
+  # replace_triggered_by only accepts a whole resource, count.index or each.key,
+  # and aws_instance.nodes as a whole would re-run forest creation every time any
+  # unrelated host is replaced. Losing the bootstrap host destroys the domain and
+  # needs a full redeploy regardless, so there is nothing to order around here.
 
   depends_on = [time_sleep.wait_for_bootstrap_reboot]
 }
@@ -854,6 +896,16 @@ resource "aws_ssm_association" "promote_dc" {
   # SRV wait (600s) + promotion + reboot + AD DS startup.
   wait_for_success_timeout_seconds = 1800
 
+  # Replacing an instance would otherwise leave this association in place and
+  # merely update its targets. An update does not honour
+  # wait_for_success_timeout_seconds — it returns as soon as the API call lands —
+  # so the phase ordering collapses and State Manager re-fires every phase at once
+  # against a host that has not been renamed or rebooted yet. Forcing a replace
+  # puts each phase back through create, which does wait for success.
+  lifecycle {
+    replace_triggered_by = [aws_instance.nodes[each.key]]
+  }
+
   depends_on = [time_sleep.wait_for_join_reboot]
 }
 
@@ -953,6 +1005,16 @@ resource "aws_ssm_association" "configure_promoted_dc" {
   }
 
   wait_for_success_timeout_seconds = 600
+
+  # Replacing an instance would otherwise leave this association in place and
+  # merely update its targets. An update does not honour
+  # wait_for_success_timeout_seconds — it returns as soon as the API call lands —
+  # so the phase ordering collapses and State Manager re-fires every phase at once
+  # against a host that has not been renamed or rebooted yet. Forcing a replace
+  # puts each phase back through create, which does wait for success.
+  lifecycle {
+    replace_triggered_by = [aws_instance.nodes[each.key]]
+  }
 
   depends_on = [time_sleep.wait_for_promotion]
 }
@@ -1066,6 +1128,16 @@ resource "aws_ssm_association" "join_domain" {
 
   # DNS wait (600s) + LDAP wait (300s) + join retries (150s) + reboot
   wait_for_success_timeout_seconds = 1200
+
+  # Replacing an instance would otherwise leave this association in place and
+  # merely update its targets. An update does not honour
+  # wait_for_success_timeout_seconds — it returns as soon as the API call lands —
+  # so the phase ordering collapses and State Manager re-fires every phase at once
+  # against a host that has not been renamed or rebooted yet. Forcing a replace
+  # puts each phase back through create, which does wait for success.
+  lifecycle {
+    replace_triggered_by = [aws_instance.nodes[each.key]]
+  }
 
   depends_on = [aws_ssm_association.configure_dns_forwarder, time_sleep.wait_for_features_reboot]
 }
@@ -1209,6 +1281,16 @@ resource "aws_ssm_association" "credential_setup" {
 
   wait_for_success_timeout_seconds = 600
 
+  # Replacing an instance would otherwise leave this association in place and
+  # merely update its targets. An update does not honour
+  # wait_for_success_timeout_seconds — it returns as soon as the API call lands —
+  # so the phase ordering collapses and State Manager re-fires every phase at once
+  # against a host that has not been renamed or rebooted yet. Forcing a replace
+  # puts each phase back through create, which does wait for success.
+  lifecycle {
+    replace_triggered_by = [aws_instance.nodes[each.key]]
+  }
+
   depends_on = [time_sleep.wait_for_join_reboot, time_sleep.wait_for_promotion, aws_ssm_association.configure_promoted_dc]
 }
 
@@ -1336,6 +1418,16 @@ resource "aws_ssm_association" "agent_setup" {
   }
 
   wait_for_success_timeout_seconds = 300
+
+  # Replacing an instance would otherwise leave this association in place and
+  # merely update its targets. An update does not honour
+  # wait_for_success_timeout_seconds — it returns as soon as the API call lands —
+  # so the phase ordering collapses and State Manager re-fires every phase at once
+  # against a host that has not been renamed or rebooted yet. Forcing a replace
+  # puts each phase back through create, which does wait for success.
+  lifecycle {
+    replace_triggered_by = [aws_instance.nodes[each.key]]
+  }
 
   depends_on = [aws_ssm_association.credential_setup]
 }
