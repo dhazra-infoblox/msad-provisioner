@@ -1,5 +1,52 @@
 # Troubleshooting
 
+## `terraform plan` fails on a host name
+
+Host names are validated at plan time against the 15-character Windows computer name limit, plus the character and uniqueness rules. The error names every offender and its length.
+
+Fix the name in the config — the convention is `<prefix>-srvNN` / `<prefix>-cltNN`, e.g. `sw-srv01`. Renaming a host that is already deployed **replaces its instance**, since the name is the resource key. To keep a legacy setup planning while you migrate, add:
+
+```yaml
+validation:
+  hostnames: false
+```
+
+Structural failures (duplicate names, an invalid role, no or several `bootstrap: true` hosts, not enough free IPs) cannot be bypassed — the plan could not succeed anyway.
+
+## promote_dc fails or times out
+
+The promotion phase is the least-exercised part of the pipeline. Check the log
+first: `make logs PHASE=promote-dc HOST=sw-dc02`.
+
+| Symptom | Likely cause |
+|---------|--------------|
+| `DC SRV record ... not found after 600s` | The first DC is not answering, or this host's resolver never got the DC's IP. Check `bootstrap_domain` and `dns_forwarder` completed, then `Resolve-DnsName _ldap._tcp.dc._msdcs.<domain> -Type SRV` on the host. |
+| Association times out with no output | Promotion reboots the host; if SSM never comes back, DNS is the usual reason. See below. |
+| `The credentials supplied ... are not sufficient` | `domain.admin_user` must be a Domain Admin. The bootstrap phase sets the built-in Administrator password to `admin_password`, so those two must agree. |
+
+If a promoted DC goes silent after its reboot, it is almost always name
+resolution: promotion installs the DNS role and can repoint the resolver at
+itself, and an AD DNS server in a private subnet cannot reach the root hints, so
+`ssm.<region>.amazonaws.com` stops resolving. That is what `configure_promoted_dc`
+repairs — but if the host is already unreachable, SSM cannot deliver it. Recover
+over RDP:
+
+```powershell
+Set-DnsClientServerAddress -InterfaceIndex (Get-NetAdapter | ? Status -eq Up).IfIndex `
+  -ServerAddresses 127.0.0.1,<vpc-dns-ip>
+Add-DnsServerForwarder -IPAddress <vpc-dns-ip>
+```
+
+The VPC DNS address is the VPC CIDR's `.2` — `terraform output` shows the subnet.
+
+To confirm a promotion actually took:
+
+```powershell
+(Get-CimInstance Win32_ComputerSystem).DomainRole   # 4 or 5 = DC, 3 = member server
+Get-ADDomainController -Filter * | Select HostName, Site, IsGlobalCatalog
+repadmin /showrepl
+```
+
 ## SSM agent not connecting
 
 Check that your security group allows outbound HTTPS (443) to AWS endpoints. The VMs need to reach `ssm.us-east-1.amazonaws.com`, `ec2messages.us-east-1.amazonaws.com`, and `ssmmessages.us-east-1.amazonaws.com`.
@@ -72,14 +119,14 @@ make apply
 SSM script output (Write-Host) does **not** appear in `terraform apply` output. Terraform only waits for Success/Failed. View logs via S3:
 
 ```bash
-make logs PHASE=credential-setup HOST=dhcp02          # latest run
-make logs PHASE=credential-setup HOST=dhcp02 RUN=all  # list all runs
-make logs PHASE=credential-setup HOST=dhcp02 RUN=3    # specific run
+make logs PHASE=credential-setup HOST=naq-srv02          # latest run
+make logs PHASE=credential-setup HOST=naq-srv02 RUN=all  # list all runs
+make logs PHASE=credential-setup HOST=naq-srv02 RUN=3    # specific run
 ```
 
 ## Verification checklist
 
-After `make apply` completes, verify from the agent client (client01):
+After `make apply` completes, verify from the agent client (`<prefix>-clt01`):
 
 ```powershell
 # RSAT tools installed?
@@ -98,4 +145,4 @@ Invoke-Command -ComputerName <DC_IP> -Credential $cred -Authentication Credssp `
   -ScriptBlock { "OK from $(hostname) as $(whoami)" }
 ```
 
-Verify WMI on DHCP servers: RDP into dhcp01/dhcp02 → `wmimgmt.msc` → Properties → Security → `Root\Microsoft\Windows\DNS` (or `DHCP`). The service user and DNSAdmins should have **Enable Account**, **Execute Methods**, and **Remote Enable** checked.
+Verify WMI on the server hosts: RDP into `<prefix>-srv01`/`<prefix>-srv02` → `wmimgmt.msc` → Properties → Security → `Root\Microsoft\Windows\DNS` (or `DHCP`). The service user and DNSAdmins should have **Enable Account**, **Execute Methods**, and **Remote Enable** checked.

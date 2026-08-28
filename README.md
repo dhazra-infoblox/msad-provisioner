@@ -1,6 +1,8 @@
 # MSAD Provisioner
 
-Automated provisioning of Windows Server VMs with Active Directory, DHCP, DNS, CredSSP delegation, and WMI permissions on AWS using Terraform and SSM.
+Automated provisioning of Windows Server VMs with Active Directory, DNS, DHCP, CredSSP delegation, and WMI permissions on AWS using Terraform and SSM.
+
+Every host gets the full AD + DNS + DHCP stack, so the same setup serves AD, DNS and DHCP work alike.
 
 ## Prerequisites
 
@@ -45,6 +47,14 @@ make progress lab1
 make destroy lab1
 ```
 
+`create-setup` derives the domain, the IP offset, and a short host prefix from the setup name (see [Host Naming](#host-naming)). Override any of them:
+
+```bash
+make create-setup SETUP=stgwin                      # hosts: sw-srv01, sw-srv02, sw-clt01
+make create-setup SETUP=stgwin PREFIX=stg           # hosts: stg-srv01, stg-srv02, stg-clt01
+make create-setup SETUP=stgwin DOMAIN=win.stage.lab NETBIOS=WINSTAGE IP_OFFSET=210
+```
+
 ## Multi-Setup (Workspaces)
 
 Multiple independent AD environments can coexist in the same AWS account using named setups. Each setup gets its own:
@@ -72,9 +82,9 @@ When multiple setups share the same subnet, two fields in each config must be un
 | `aws.name_prefix` | Drives SSM document names in AWS (must be globally unique per account) | `msad_lab1`, `msad_lab2` |
 | `network.ip_start_offset` | Which IP index to start assigning from; prevents IP conflicts | `10`, `30`, `50`, `70` … |
 
-Allow at least 20 IP slots per setup (2 DHCP servers + 1 agent client + buffer). The `create-setup` script auto-picks a safe offset by scanning all existing configs.
+Allow at least 20 IP slots per setup (2 server hosts + 1 agent client + buffer). The `create-setup` script auto-picks a safe offset by scanning all existing configs.
 
-`ip_start_offset` only governs where auto-assignment *begins*; it does not reserve a range. Growing a setup past its slice will run into the next setup's offset, and the `ip_capacity` check fails at plan time if the subnet runs out of room past the offset. Pin IPs with [`make lock-ips`](#ip-pinning) so allocations stay put.
+`ip_start_offset` only governs where auto-assignment *begins*; it does not reserve a range. Growing a setup past its slice will run into the next setup's offset, and the IP capacity precondition fails the plan if the subnet runs out of room past the offset. Pin IPs with [`make lock-ips`](#ip-pinning) so allocations stay put.
 
 ### Existing setups
 
@@ -89,26 +99,132 @@ Allow at least 20 IP slots per setup (2 DHCP servers + 1 agent client + buffer).
 
 ## Host Roles
 
+A role names what the host *is*, not one of the services it runs — a `srv` host carries AD, DNS and DHCP together.
+
 | Role | Description |
 |------|-------------|
-| `dhcp_server` | DHCP + DNS + AD tools. The `bootstrap: true` host creates the AD forest. |
-| `agent_client` | RSAT tools + CredSSP client. Joins domain as member server. |
-| `domain_controller` | AD DS + DHCP + DNS. Additional DC (if not bootstrap). |
+| `dc` | Domain controller: AD DS + DNS + DHCP. The `bootstrap: true` host creates the forest and is the first DC. |
+| `srv` | Member server: DNS + DHCP + AD tools. Domain-joined, never promoted. |
+| `clt` | Agent client: RSAT tools + CredSSP client. Joins the domain as a member server. |
+
+`dc` and `srv` are both *managed servers* — the agent's target list and the `TrustedHosts` set cover both, because a DC runs DNS and DHCP just like a member server does. Only `clt` is treated differently.
+
+The original names are still accepted as aliases, so a config written against the old schema needs no edit:
+
+| Legacy role | Canonical role |
+|-------------|----------------|
+| `dhcp_server` | `srv` |
+| `agent_client` | `clt` |
+| `domain_controller` | `dc` |
+
+Terraform normalises the alias before anything sees it, so `terraform output host_inventory`, the `HostRole` tag, and the SSM parameters all report the short form.
+
+### Multiple domain controllers
+
+AD supports any number of read/write DCs per domain, and the role model here is named for that: the bootstrap host is `dc01`, a second would be `dc02`.
+
+Declare as many `dc` hosts as you want. The bootstrap host creates the forest (`Install-ADDSForest`); every other `dc` host is promoted into the same domain by the `promote_dc` phase (`Install-ADDSDomainController -InstallDns`), so it ends up a writable DC with a replicated copy of the AD-integrated DNS zones.
+
+```yaml
+hosts:
+  - name: sw-dc01      # creates the forest, holds all 5 FSMO roles
+    role: dc
+    bootstrap: true
+  - name: sw-dc02      # joins, then gets promoted
+    role: dc
+  - name: sw-srv01     # member server: DNS + DHCP, no directory copy
+    role: srv
+  - name: sw-clt01
+    role: clt
+```
+
+> **Not yet exercised against a live domain.** The phase is written and the plan
+> is clean, but no two-DC setup has been applied yet. Try it on a scratch setup
+> before using it for anything that matters.
+
+Two consequences worth knowing:
+
+- **A promoted DC gets its own DNS phase.** Promotion installs the DNS role and can repoint the host's resolver at itself, which would break resolution of the AWS SSM endpoints — an AD DNS server in a private subnet cannot reach the root hints. `configure_promoted_dc` re-asserts the resolver list and adds the same VPC forwarder the first DC gets. The existing forwarder phase cannot cover both, because `join_domain` depends on it and waiting for promotion would close a dependency cycle.
+- **`credential_setup` is now DC-aware.** Promotion converts a host's local groups into domain groups, so the `Add-LocalGroupMember` path fails on a DC. The `IsBootstrap` parameter became `IsDomainController` and covers every DC. On a single-DC setup the value is identical to before.
+
+Still open: removing a `dc` host from a live config destroys the instance without demoting it, which leaves an orphaned DC object and stale SRV records in AD. See **[D4]** in [MULTI_DC_PLAN.md](MULTI_DC_PLAN.md). Full `make destroy` / `make redeploy` are unaffected — the whole domain goes with them.
+
+## Host Naming
+
+Windows caps a computer (NetBIOS) name at **15 characters**, which is the tightest constraint in the whole config. The convention is `<prefix>-<role>NN` — `dcNN`, `srvNN` or `cltNN` — where the prefix is an abbreviation of the setup name:
+
+```
+stgwin  →  sw-dc01, sw-srv01, sw-srv02, sw-clt01
+hari    →  hari-dc01, hari-srv01, hari-clt01
+```
+
+The suffix matches the role, so a multi-DC setup reads as `sw-dc01`, `sw-dc02`.
+
+`create-setup` derives the prefix by length: 2 characters for a setup name up to 6, 3 up to 9, 4 up to 12 — one character per 3 characters of input. The name is split into that many chunks and the first letter of each is taken. Names under 6 characters are used whole.
+
+| Setup | Prefix | Chunks | Example host |
+|-------|--------|--------|--------------|
+| `hari` | `hari` | (under 6 — used whole) | `hari-dc01` |
+| `stgwin` | `sw` | `stg` `win` | `sw-dc01` |
+| `nstarqa` | `naq` | `nst` `ar` `qa` | `naq-dc01` |
+| `failover` | `fle` | `fai` `lov` `er` | `fle-dc01` |
+| `b1ddimigrate` | `bdia` | `b1d` `dim` `igr` `ate` | `bdia-dc01` |
+
+Pass `PREFIX=` to `create-setup` when the derived form is unhelpful. The prefix is capped at 9 characters so `<prefix>-srv01` still fits in 15.
+
+## Plan-Time Validation
+
+The config is validated by preconditions on `terraform_data.validation`, so a bad config **fails `terraform plan`** instead of failing hours into an apply. (These were `check` blocks before, which only ever produced warnings.)
+
+| Rule | Bypassable |
+|------|------------|
+| Host name ≤ 15 characters | yes |
+| Host name is letters, digits and inner hyphens only | yes |
+| Host name is not all digits | yes |
+| `domain.netbios` is 1–15 valid characters | yes |
+| Host names are unique | no |
+| Every role is `srv` / `clt` / `dc` (or a legacy alias) | no |
+| Exactly one host sets `bootstrap: true` | no |
+| Enough free IPs for every unpinned host | no |
+
+The name-shape rules are bypassable because correcting a deployed host's name replaces its instance. A setup that predates these checks can keep planning while it migrates:
+
+```yaml
+validation:
+  hostnames: false      # only for legacy setups; remove once names are fixed
+```
+
+The structural rules are never bypassable — a plan that violates them cannot succeed anyway.
+
+### Migrating an existing setup
+
+Full detail in [MIGRATION.md](MIGRATION.md). In short, a deployed setup keeps working as-is: the legacy role names still resolve, and the `aws.name_prefix` default changed for *newly scaffolded* setups only. Do not edit `name_prefix` in an existing config — it renames the SSM documents, which replaces every association.
+
+Two things to expect:
+
+- **Roles.** The first `apply` after this change rewrites the `HostRole` tag and the `install_features` SSM parameter from `dhcp_server` to `srv`, which re-runs the feature install on existing hosts. That is idempotent (`Install-WindowsFeature` no-ops on installed features) but costs a few minutes per host. Renaming the roles in the config to `srv`/`clt` yourself has the same effect, no more. An existing bootstrap host stays `srv` — it is a DC in fact, but changing it to `dc` buys nothing today, and renaming it to `<prefix>-dc01` would replace the instance.
+- **Host names.** Setups that already carry an over-length name fail validation on their next plan. As of this change that is `amanperf`, `failover`, `hemanth`, `msmulti`, `nstarqa` (each `<setup>-client01`, 16–17 chars) and `stage10` (`stage10-client01`, `stage10-client02`). Either rename the host to `<prefix>-clt01` — which **replaces that instance** — or set `validation.hostnames: false` in the config to keep planning meanwhile.
+
+Those over-length hosts are worth a look either way: `rename_computer` cannot apply a 16-character name, so the affected VM is likely still running under its EC2-assigned name. Check with `make progress <setup>`.
 
 ## Provisioning Phases
 
 ```
-1. rename_computer       → Set hostname (reboot)
-2. configure_networking  → Static IP, DNS, IMDS route
-3. install_features      → Role-specific Windows features
-4. bootstrap_domain      → Create AD forest on bootstrap host (reboot)
-5. dns_forwarder         → VPC DNS forwarder on the DC
-6. join_domain           → Domain join with SRV polling + retries (reboot)
-7. credential_setup      → Service user, CredSSP server, WMI ACLs, DHCP post-install
-8. agent_setup           → CredSSP client, GPO delegation, target list, e2e verification
+1.  rename_computer        → Set hostname (reboot)
+2.  configure_networking   → Static IP, DNS, IMDS route
+3.  install_features       → Role-specific Windows features
+4.  bootstrap_domain       → Create AD forest on the bootstrap host (reboot)
+5.  dns_forwarder          → VPC DNS forwarder on the first DC
+6.  join_domain            → Domain join with SRV polling + retries (reboot)
+7.  promote_dc             → Promote additional dc hosts (reboot)   ← only if any
+8.  configure_promoted_dc  → Resolver list + VPC forwarder on promoted DCs
+9.  credential_setup       → Service user, CredSSP server, WMI ACLs, DHCP post-install
+10. agent_setup            → CredSSP client, GPO delegation, target list, e2e verification
 ```
 
-Phases are chained via `depends_on` and `time_sleep` resources (90 s rename / 120 s features / 180 s bootstrap / 90 s join) to accommodate Windows reboots.
+Phases 7 and 8 have no targets unless the config declares a `dc` host other than the bootstrap host, so a single-DC setup runs exactly the pipeline it always did.
+
+Phases are chained via `depends_on` and `time_sleep` resources (90 s rename / 120 s features / 180 s bootstrap / 90 s join / 240 s promotion) to accommodate Windows reboots. The promotion wait is longer because AD DS has to start and SYSVOL has to finish its initial DFSR sync.
 
 Each `time_sleep` keys its `triggers` off the association IDs of the phase before it, so the wait re-runs when hosts are added. Without that, a newly added host would be handed to the next phase while it was still rebooting, and the phase would fail against a machine that was mid-restart.
 
@@ -148,9 +264,9 @@ Hosts without an explicit `ip:` are assigned addresses by index into the list of
 
 ```yaml
 hosts:
-  - name: lab1-dhcp01
+  - name: lab1-srv01
     ip: 172.28.26.225      # ← added by lock-ips
-    role: dhcp_server
+    role: srv
     bootstrap: true
 ```
 
@@ -214,13 +330,13 @@ Removing a host is the same minus step 4's `lock-ips`: delete its block from the
 
 ### What actually changes
 
-Adding one `dhcp_server` and one `agent_client` to a healthy 5-host setup plans as:
+Adding one `srv` and one `clt` host to a healthy 5-host setup plans as:
 
 | Resource | Action | Why |
 |----------|--------|-----|
 | `aws_instance.nodes` (new hosts only) | created | **No existing instance is touched** |
 | All 6 phases for the new hosts | created | They provision from scratch |
-| `credential_setup` on existing DHCP hosts | updated in-place | `TrustedHosts` gained an IP |
+| `credential_setup` on existing server hosts | updated in-place | `TrustedHosts` gained an IP |
 | `agent_setup` on existing clients | updated in-place | `TargetServers` gained an IP |
 | The 3 `time_sleep` resources | replaced | `triggers` changed, so reboot waits re-run |
 
@@ -230,11 +346,11 @@ The in-place updates re-run those scripts on existing machines. They are idempot
 
 | Check | Limit | Symptom if violated |
 |-------|-------|---------------------|
-| Hostname length | **≤ 15 characters** | `rename_computer` fails. `lab1-client01` is 16 and fails; `lab1-clt01` is 10 and works. |
-| Free IPs past `ip_start_offset` | Enough for the new hosts | Plan fails the `ip_capacity` check |
+| Hostname length | **≤ 15 characters** | Plan fails validation. `lab1-client01` is 16; `lab1-clt01` is 10 and works. |
+| Free IPs past `ip_start_offset` | Enough for the new hosts | Plan fails the IP capacity precondition |
 | EC2 vCPU quota | Account-wide | Instances launch then vanish: `collecting instance settings: empty result` |
 
-The NetBIOS 15-character cap is the easiest one to trip, since role names like `client01` push a prefixed name over on their own. Prefer short forms such as `clt01`.
+The 15-character cap is the easiest one to trip, since a long suffix like `client01` pushes a prefixed name over on its own — that is exactly why the suffixes are `srvNN` and `cltNN`. The first two rows are now caught at plan time rather than mid-apply.
 
 ### Caveat: a clean apply does not mean every phase passed
 
@@ -246,7 +362,7 @@ The NetBIOS 15-character cap is the easiest one to trip, since role names like `
 terraform -chdir=terraform apply \
   -var="config_file=../config/lab1.yml" \
   -var-file="secret.lab1.tfvars" \
-  -replace='aws_ssm_association.configure_networking["lab1-dhcp04"]' \
+  -replace='aws_ssm_association.configure_networking["lab1-srv04"]' \
   --auto-approve
 ```
 
@@ -259,9 +375,9 @@ Individual phases can also fail transiently when a host is slow to finish a rebo
 Credentials are read directly from local files — no secrets server required.
 
 ```bash
-make creds              # table of all hosts (instance ID, IP, username, password)
-make creds HOST=dhcp01  # details for a single host
-make creds nstarqa      # credentials for a named setup
+make creds                # table of all hosts (instance ID, IP, username, password)
+make creds HOST=naq-srv01 # details for a single host
+make creds nstarqa        # credentials for a named setup
 ```
 
 Sources used:
@@ -286,9 +402,9 @@ Browse logs with:
 ```bash
 make logs                              # list phases with logs
 make logs PHASE=join-domain            # list hosts for that phase
-make logs PHASE=join-domain HOST=dhcp02          # show latest stdout/stderr
-make logs PHASE=join-domain HOST=dhcp02 RUN=all  # list all runs
-make logs PHASE=join-domain HOST=dhcp02 RUN=2    # show a specific run
+make logs PHASE=join-domain HOST=naq-srv02          # show latest stdout/stderr
+make logs PHASE=join-domain HOST=naq-srv02 RUN=all  # list all runs
+make logs PHASE=join-domain HOST=naq-srv02 RUN=2    # show a specific run
 ```
 
 ## Performance Testing
@@ -297,7 +413,7 @@ Two scripts can be uploaded to the VMs to stress-test the Infoblox agent against
 
 | Script | Target | Purpose |
 |--------|--------|---------|
-| `scripts/bulk_dhcp_load.ps1` | DHCP servers | Create synthetic `/24` scopes with optional static reservations |
+| `scripts/bulk_dhcp_load.ps1` | Server hosts (`srv`) | Create synthetic `/24` scopes with optional static reservations |
 | `scripts/performance.ps1` | Agent clients | Sample CPU/memory of the `InfobloxAgentForMicrosoft` process |
 
 ```bash
@@ -317,7 +433,7 @@ config/
   <setup>.yml              # named setup config (gitignored)
 
 terraform/
-  main.tf                  # EC2, IAM, 8 SSM documents + associations
+  main.tf                  # EC2, IAM, 10 SSM documents + associations
   variables.tf             # input variables
   outputs.tf               # host_inventory, phase_association_ids, etc.
   secret.tfvars            # default setup passwords (gitignored)
@@ -335,6 +451,8 @@ scripts/
 
 Makefile                   # all operator commands
 TROUBLESHOOTING.md         # debugging guide
+MIGRATION.md               # generic-naming + validation migration notes
+MULTI_DC_PLAN.md           # design proposal for multiple domain controllers
 ```
 
 See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for debugging common issues, verification steps, and WMI/CredSSP diagnostics.
