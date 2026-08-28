@@ -971,7 +971,22 @@ resource "aws_ssm_document" "configure_promoted_dc" {
           "if ('{{ VpcDns }}' -notin $existing) { Add-DnsServerForwarder -IPAddress '{{ VpcDns }}' -PassThru | Out-Null; Write-Host 'VPC DNS forwarder added' } else { Write-Host 'VPC DNS forwarder already present' }",
           "",
           "try { Clear-DnsClientCache } catch {}",
-          "$dc = Get-ADDomainController -Identity $env:COMPUTERNAME -ErrorAction Stop",
+          "",
+          "# Promotion changes this host's identity from member server to domain",
+          "# controller, so the machine account's cached Kerberos tickets are stale.",
+          "# SSM runs as SYSTEM and presents them, which AD rejects with",
+          "# \"the server has rejected the client credentials\" — dropping them forces a",
+          "# fresh ticket on the next call.",
+          "try { klist -li 0x3e7 purge | Out-Null } catch {}",
+          "",
+          "# AD DS, ADWS and the SPN registrations all come up on their own schedule",
+          "# after the promotion reboot, so this is retried rather than run once. The",
+          "# query is aimed at this DC by name: -Identity resolves through whichever DC",
+          "# the locator picks, which is the round trip that fails while credentials are",
+          "# still settling.",
+          "$dc = $null",
+          "foreach ($attempt in 1..10) { try { $dc = Get-ADDomainController -Server $env:COMPUTERNAME -ErrorAction Stop; break } catch { Write-Host \"Attempt $attempt/10: DC not answering yet ($($_.Exception.Message))\"; if ($attempt -lt 10) { Start-Sleep -Seconds 30 } } }",
+          "if (-not $dc) { throw \"Promotion verification failed: $env:COMPUTERNAME did not answer as a domain controller after 5 minutes\" }",
           "Write-Host \"Promoted DC confirmed: $($dc.HostName), site $($dc.Site), GC=$($dc.IsGlobalCatalog)\""
         ]
       }
