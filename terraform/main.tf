@@ -906,7 +906,13 @@ resource "aws_ssm_association" "promote_dc" {
     replace_triggered_by = [aws_instance.nodes[each.key]]
   }
 
-  depends_on = [time_sleep.wait_for_join_reboot]
+  # wait_for_features_reboot is named directly rather than relied on through the
+  # join/promotion chain. depends_on only orders operations *within one apply*: if
+  # the intervening resources are not changing they contribute no edge, and this
+  # phase is then free to run in parallel with an install_windows_features that is
+  # being replaced on its own. That is how de-dc02 came to run this phase while
+  # the DHCP role was still installing.
+  depends_on = [time_sleep.wait_for_features_reboot, time_sleep.wait_for_join_reboot]
 }
 
 resource "time_sleep" "wait_for_promotion" {
@@ -1031,7 +1037,13 @@ resource "aws_ssm_association" "configure_promoted_dc" {
     replace_triggered_by = [aws_instance.nodes[each.key]]
   }
 
-  depends_on = [time_sleep.wait_for_promotion]
+  # wait_for_features_reboot is named directly rather than relied on through the
+  # join/promotion chain. depends_on only orders operations *within one apply*: if
+  # the intervening resources are not changing they contribute no edge, and this
+  # phase is then free to run in parallel with an install_windows_features that is
+  # being replaced on its own. That is how de-dc02 came to run this phase while
+  # the DHCP role was still installing.
+  depends_on = [time_sleep.wait_for_features_reboot, time_sleep.wait_for_promotion]
 }
 
 resource "aws_ssm_document" "join_domain" {
@@ -1306,7 +1318,13 @@ resource "aws_ssm_association" "credential_setup" {
     replace_triggered_by = [aws_instance.nodes[each.key]]
   }
 
-  depends_on = [time_sleep.wait_for_join_reboot, time_sleep.wait_for_promotion, aws_ssm_association.configure_promoted_dc]
+  # wait_for_features_reboot is named directly rather than relied on through the
+  # join/promotion chain. depends_on only orders operations *within one apply*: if
+  # the intervening resources are not changing they contribute no edge, and this
+  # phase is then free to run in parallel with an install_windows_features that is
+  # being replaced on its own. That is how de-dc02 came to run this phase while
+  # the DHCP role was still installing.
+  depends_on = [time_sleep.wait_for_features_reboot, time_sleep.wait_for_join_reboot, time_sleep.wait_for_promotion, aws_ssm_association.configure_promoted_dc]
 }
 
 resource "time_sleep" "wait_for_join_reboot" {
@@ -1444,5 +1462,11 @@ resource "aws_ssm_association" "agent_setup" {
     replace_triggered_by = [aws_instance.nodes[each.key]]
   }
 
-  depends_on = [aws_ssm_association.credential_setup]
+  # wait_for_features_reboot is named directly rather than relied on through the
+  # join/promotion chain. depends_on only orders operations *within one apply*: if
+  # the intervening resources are not changing they contribute no edge, and this
+  # phase is then free to run in parallel with an install_windows_features that is
+  # being replaced on its own. That is how de-dc02 came to run this phase while
+  # the DHCP role was still installing.
+  depends_on = [time_sleep.wait_for_features_reboot, aws_ssm_association.credential_setup]
 }
