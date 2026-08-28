@@ -46,95 +46,157 @@ export TF_WORKSPACE
 terraform -chdir="$TF_DIR" workspace list 2>/dev/null | sed 's/^[* ]*//' | grep -qx "$TF_WORKSPACE" \
   || { echo "Workspace '$TF_WORKSPACE' not found — run 'make apply SETUP=$TF_WORKSPACE' first"; exit 1; }
 
-# Association IDs are read out of the state file rather than the
-# phase_association_ids output. Terraform only recomputes outputs at the end of a
-# successful apply, so after a partial failure the output still describes the
-# previous run and every host added since is missing from this table — which is
-# exactly the moment you want to look at it. The state is written as each
-# resource completes, so it sees the whole fleet.
-state_ids() {
-  terraform -chdir="$TF_DIR" show -json 2>/dev/null | python3 -c '
-import json, sys
+# Emits one "phase<TAB>host<TAB>association_id" row per host/phase the pipeline is
+# expected to run, association_id empty when it has not been created yet.
+#
+# The expected host set comes from the config, not from the associations that
+# happen to exist: an apply that fails partway never creates the later phases, so
+# reading only what exists silently drops every host still waiting on them — the
+# table then looks complete while most of the fleet is missing from it.
+#
+# Association IDs come from the state file rather than the phase_association_ids
+# output. Terraform only recomputes outputs at the end of a *successful* apply, so
+# after a partial failure the output still describes the previous run. The state
+# is written as each resource completes, so it sees the whole fleet.
+phase_rows() {
+  python3 -c '
+import json, re, subprocess, sys
 
+config_file, tf_dir = sys.argv[1], sys.argv[2]
+
+# Phases in pipeline execution order.
+PHASE_ORDER = [
+    "rename_computer", "configure_networking", "install_windows_features",
+    "bootstrap_domain", "configure_dns_forwarder", "join_domain",
+    "promote_dc", "configure_promoted_dc", "credential_setup", "agent_setup",
+]
+
+# --- hosts from the config -------------------------------------------------
+# Parsed by hand rather than with PyYAML, which is not a dependency of this
+# repo; the hosts block is a flat list of scalars, same as lock_ips.py assumes.
+hosts, cur, in_hosts = [], None, False
+with open(config_file) as fh:
+    for line in fh:
+        line = line.rstrip("\n")
+        if re.match(r"^hosts:\s*$", line):
+            in_hosts = True
+            continue
+        if in_hosts and re.match(r"^\S", line):
+            break
+        if not in_hosts:
+            continue
+        m = re.match(r"^\s+-\s+name:\s*(\S+)", line)
+        if m:
+            cur = {"name": m.group(1), "role": None, "bootstrap": False}
+            hosts.append(cur)
+            continue
+        if cur is None:
+            continue
+        m = re.match(r"^\s+role:\s*(\S+)", line)
+        if m:
+            cur["role"] = m.group(1)
+            continue
+        m = re.match(r"^\s+bootstrap:\s*(\S+)", line)
+        if m:
+            cur["bootstrap"] = m.group(1).strip().lower() in ("true", "yes")
+
+# Same aliases main.tf accepts, so a config on the old schema still resolves.
+ALIASES = {"dhcp_server": "srv", "agent_client": "clt", "domain_controller": "dc"}
+roles = {h["name"]: ALIASES.get(h["role"], h["role"]) for h in hosts}
+names = [h["name"] for h in hosts]
+
+bootstraps = [h["name"] for h in hosts if h["bootstrap"]]
+bootstrap = bootstraps[0] if len(bootstraps) == 1 else None
+
+servers = [n for n in names if roles.get(n) in ("srv", "dc")]
+promotable = [n for n in names if roles.get(n) == "dc" and n != bootstrap]
+clients = [n for n in names if roles.get(n) == "clt"]
+
+# Mirrors the for_each on each aws_ssm_association in terraform/main.tf.
+expected = {
+    "rename_computer": names,
+    "configure_networking": names,
+    "install_windows_features": names,
+    "bootstrap_domain": ["global"],
+    "configure_dns_forwarder": ["global"],
+    "join_domain": [n for n in names if n != bootstrap],
+    "promote_dc": promotable,
+    "configure_promoted_dc": promotable,
+    "credential_setup": [n for n in names if n in servers or n == bootstrap],
+    "agent_setup": clients,
+}
+
+# --- association IDs from state -------------------------------------------
+found = {}
+proc = subprocess.run(
+    ["terraform", "-chdir=" + tf_dir, "show", "-json"],
+    capture_output=True, text=True,
+)
 try:
-    doc = json.load(sys.stdin)
+    doc = json.loads(proc.stdout)
 except ValueError:
-    sys.exit(1)
+    doc = {}
 
-phases = {}
 for res in doc.get("values", {}).get("root_module", {}).get("resources", []):
     if res.get("type") != "aws_ssm_association":
         continue
-    # An association whose create timed out is left tainted, with only its
-    # primary key persisted: association_id is null but id holds the same value.
-    # Preferring id keeps that host reporting its real status — the pending
-    # execution that caused the timeout — instead of looking absent.
+    # An association whose create timed out is left tainted with only its
+    # primary key persisted: association_id is null but id holds the same
+    # value. Preferring id keeps that host reporting the pending execution
+    # that caused the timeout instead of looking absent.
     vals = res.get("values", {})
-    assoc_id = vals.get("association_id") or vals.get("id")
+    assoc_id = vals.get("association_id") or vals.get("id") or ""
     index = res.get("index")
-    if index is None:
-        phases[res["name"]] = assoc_id
-    else:
-        phases.setdefault(res["name"], {})[str(index)] = assoc_id
-json.dump(phases, sys.stdout)
-'
+    host = "global" if index is None else str(index)
+    found.setdefault(res["name"], {})[host] = assoc_id
+
+for phase in PHASE_ORDER:
+    in_state = found.get(phase, {})
+    # Anything in state but not expected — a host dropped from the config whose
+    # association has not been reaped yet — still gets a row, so it stays visible.
+    order = sorted(expected.get(phase, [])) + sorted(set(in_state) - set(expected.get(phase, [])))
+    for host in order:
+        print("\t".join([phase, host, in_state.get(host, "")]))
+' "$1" "$2"
 }
 
-all_ids_json=$(state_ids || true)
+rows=$(phase_rows "$CONFIG_FILE" "$TF_DIR" || true)
 
-if [ -z "$all_ids_json" ] || [ "$all_ids_json" = "{}" ]; then
-  echo "No SSM associations in state for workspace '$TF_WORKSPACE'. Run apply first."
+if [ -z "$rows" ]; then
+  echo "No hosts found in $CONFIG_FILE."
   exit 1
 fi
-
-# Ordered list of phases matching the execution pipeline order.
-PHASE_ORDER="rename_computer configure_networking install_windows_features bootstrap_domain configure_dns_forwarder join_domain promote_dc configure_promoted_dc credential_setup agent_setup"
 
 echo "SSM Phase Progress"
 echo "=================="
 printf "%-28s %-16s %-10s %-12s %s\n" "PHASE" "HOST" "STATUS" "DURATION" "COMPLETED_AT"
 echo "--------------------------------------------------------------------------------------------"
 
-for phase in $PHASE_ORDER; do
-  phase_data=$(echo "$all_ids_json" | jq --arg p "$phase" '.[$p] // empty')
-  if [ -z "$phase_data" ] || [ "$phase_data" = "null" ]; then
+echo "$rows" | while IFS=$'\t' read -r phase host assoc_id; do
+  # No association in state: the apply has not reached this phase for this host.
+  if [ -z "$assoc_id" ]; then
+    printf "%-28s %-16s %-10s %-12s %s\n" "$phase" "$host" "- waiting" "N/A" "not started"
     continue
   fi
 
-  # Build list of host/assoc_id pairs
-  type=$(echo "$phase_data" | jq -r 'type')
-  if [ "$type" = "object" ]; then
-    pairs=$(echo "$phase_data" | jq -r 'to_entries[] | [.key, .value] | @tsv')
-  else
-    pairs=$(printf "global\t%s" "$(echo "$phase_data" | jq -r '.')")
+  exec_json=$(aws --profile "$aws_profile" --region "$aws_region" \
+    ssm describe-association-executions \
+    --association-id "$assoc_id" \
+    --max-results 20 \
+    --output json 2>/dev/null || true)
+
+  assoc_json=$(aws --profile "$aws_profile" --region "$aws_region" \
+    ssm describe-association \
+    --association-id "$assoc_id" \
+    --output json 2>/dev/null || true)
+
+  if [ -z "$exec_json" ]; then
+    printf "%-28s %-16s %-10s %-12s %s\n" "$phase" "$host" "UNKNOWN" "N/A" "N/A"
+    continue
   fi
 
-  echo "$pairs" | while IFS=$'\t' read -r host assoc_id; do
-    # A host in state with no association_id is one whose association Terraform
-    # started but never finished creating — a timed-out apply leaves it this way.
-    if [ -z "$assoc_id" ] || [ "$assoc_id" = "null" ]; then
-      printf "%-28s %-16s %-10s %-12s %s\n" "$phase" "$host" "- pending" "N/A" "not created"
-      continue
-    fi
-
-    exec_json=$(aws --profile "$aws_profile" --region "$aws_region" \
-      ssm describe-association-executions \
-      --association-id "$assoc_id" \
-      --max-results 20 \
-      --output json 2>/dev/null || true)
-
-    assoc_json=$(aws --profile "$aws_profile" --region "$aws_region" \
-      ssm describe-association \
-      --association-id "$assoc_id" \
-      --output json 2>/dev/null || true)
-
-    if [ -z "$exec_json" ]; then
-      printf "%-28s %-16s %-10s %-12s %s\n" "$phase" "$host" "UNKNOWN" "N/A" "N/A"
-      continue
-    fi
-
-    # Use python to parse executions: latest result + attempt count
-    python3 - "$phase" "$host" "$exec_json" "$assoc_json" <<'PY'
+  # Use python to parse executions: latest result + attempt count
+  python3 - "$phase" "$host" "$exec_json" "$assoc_json" <<'PY'
 import json, sys, datetime
 
 phase = sys.argv[1]
@@ -144,8 +206,8 @@ assoc_data = json.loads(sys.argv[4]) if len(sys.argv) > 4 and sys.argv[4] else {
 
 execs = data.get("AssociationExecutions", [])
 if not execs:
-    print(f"{phase:<28} {host:<16} {'UNKNOWN':<10} {'N/A':<12} N/A")
-    raise SystemExit(0)
+  print(f"{phase:<28} {host:<16} {'UNKNOWN':<10} {'N/A':<12} N/A")
+  raise SystemExit(0)
 
 # Sort by created time descending
 execs.sort(key=lambda e: e.get("CreatedTime", ""), reverse=True)
@@ -161,12 +223,12 @@ created = latest.get("CreatedTime", "")
 duration = "N/A"
 assoc_desc = assoc_data.get("AssociationDescription", {})
 if status == "Success":
-    end_time = assoc_desc.get("LastSuccessfulExecutionDate", "")
+  end_time = assoc_desc.get("LastSuccessfulExecutionDate", "")
 else:
-    end_time = assoc_desc.get("LastExecutionDate", "")
+  end_time = assoc_desc.get("LastExecutionDate", "")
 
 if created and end_time:
-    try:
+  try:
         start = datetime.datetime.fromisoformat(str(created))
         end = datetime.datetime.fromisoformat(str(end_time))
         seconds = max(0, int((end - start).total_seconds()))
@@ -178,40 +240,46 @@ if created and end_time:
             duration = f"{m}m{s:02d}s"
         else:
             duration = f"{s}s"
-    except (ValueError, TypeError):
+  except (ValueError, TypeError):
         pass
 
 # Format attempt column
 if failed_attempts > 0:
-    attempt_str = f"{total_attempts} ({failed_attempts}!)"
+  attempt_str = f"{total_attempts} ({failed_attempts}!)"
 else:
-    attempt_str = str(total_attempts)
+  attempt_str = str(total_attempts)
 
 completed = end_time if end_time else (created if created else "N/A")
 
 # Status indicator
 if status == "Success":
-    status_str = "✓ Success"
+  status_str = "✓ Success"
 elif status == "Failed":
-    status_str = "✗ Failed"
+  status_str = "✗ Failed"
 elif status == "InProgress":
-    status_str = "⟳ Running"
+  status_str = "⟳ Running"
 else:
-    status_str = status
+  status_str = status
 
 print(f"{phase:<28} {host:<16} {status_str:<10} {duration:<12} {completed}")
 PY
-  done
 done
 
 # Summary: total time from first instance creation to last phase completion
-python3 - "$TF_DIR" "$aws_profile" "$aws_region" "$all_ids_json" <<'SUMMARY'
+python3 - "$TF_DIR" "$aws_profile" "$aws_region" "$rows" <<'SUMMARY'
 import json, sys, subprocess, datetime
 
 tf_dir = sys.argv[1]
 profile = sys.argv[2]
 region = sys.argv[3]
-all_ids = json.loads(sys.argv[4])
+
+# Association IDs out of the phase/host/id rows built above, skipping the phases
+# that have not been created yet.
+assoc_ids = [
+    parts[2]
+    for parts in (line.split("\t") for line in sys.argv[4].splitlines())
+    if len(parts) == 3 and parts[2]
+]
 
 # Get earliest instance launch time
 try:
@@ -242,25 +310,23 @@ except Exception:
 
 # Get latest association completion time
 latest_end = None
-for phase, data in all_ids.items():
-    ids = list(data.values()) if isinstance(data, dict) else [data]
-    for assoc_id in ids:
-        try:
-            result = subprocess.run(
-                ["aws", "ssm", "describe-association",
-                 "--association-id", assoc_id,
-                 "--output", "json", "--profile", profile, "--region", region],
-                capture_output=True, text=True
-            )
-            desc = json.loads(result.stdout).get("AssociationDescription", {})
-            for key in ("LastSuccessfulExecutionDate", "LastExecutionDate"):
-                val = desc.get(key)
-                if val:
-                    t = datetime.datetime.fromisoformat(str(val))
-                    if latest_end is None or t > latest_end:
-                        latest_end = t
-        except Exception:
-            pass
+for assoc_id in assoc_ids:
+    try:
+        result = subprocess.run(
+            ["aws", "ssm", "describe-association",
+             "--association-id", assoc_id,
+             "--output", "json", "--profile", profile, "--region", region],
+            capture_output=True, text=True
+        )
+        desc = json.loads(result.stdout).get("AssociationDescription", {})
+        for key in ("LastSuccessfulExecutionDate", "LastExecutionDate"):
+            val = desc.get(key)
+            if val:
+                t = datetime.datetime.fromisoformat(str(val))
+                if latest_end is None or t > latest_end:
+                    latest_end = t
+    except Exception:
+        pass
 
 if earliest_launch and latest_end:
     total = max(0, int((latest_end - earliest_launch).total_seconds()))
