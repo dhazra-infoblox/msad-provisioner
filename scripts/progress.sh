@@ -52,7 +52,7 @@ if ! terraform -chdir="$TF_DIR" output -json phase_association_ids >/dev/null 2>
 fi
 
 # Ordered list of phases matching the execution pipeline order.
-PHASE_ORDER="rename_computer configure_networking install_windows_features bootstrap_domain configure_dns_forwarder join_domain credential_setup agent_setup"
+PHASE_ORDER="rename_computer configure_networking install_windows_features bootstrap_domain configure_dns_forwarder join_domain promote_dc configure_promoted_dc credential_setup agent_setup"
 
 echo "SSM Phase Progress"
 echo "=================="

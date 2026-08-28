@@ -60,6 +60,17 @@ locals {
   server_hosts      = [for name in distinct(local.config_host_names) : name if contains(local.server_host_roles, local.host_roles[name])]
   client_hosts      = [for name in distinct(local.config_host_names) : name if local.host_roles[name] == "clt"]
 
+  dc_hosts = [for name in distinct(local.config_host_names) : name if local.host_roles[name] == "dc"]
+
+  # The bootstrap host is promoted by bootstrap_domain (Install-ADDSForest); every
+  # other dc host is promoted by promote_dc (Install-ADDSDomainController). Both
+  # end up as real domain controllers, which is what credential_setup branches on.
+  promotable_dc_hosts = [for name in local.dc_hosts : name if name != local.bootstrap_host]
+  domain_controllers = distinct(concat(
+    local.bootstrap_host != "" ? [local.bootstrap_host] : [],
+    local.dc_hosts
+  ))
+
   subnet_prefix_len = tonumber(split("/", data.aws_subnet.selected.cidr_block)[1])
   host_space        = pow(2, 32 - local.subnet_prefix_len)
   ip_start_offset   = try(local.network.ip_start_offset, 10)
@@ -712,6 +723,212 @@ resource "time_sleep" "wait_for_bootstrap_reboot" {
   depends_on = [aws_ssm_association.bootstrap_domain]
 }
 
+# ---------------------------------------------------------------------------
+# Phase: Promote additional domain controllers
+#
+# The bootstrap host creates the forest; every other `dc` host is promoted into
+# the same domain here. Runs after join_domain, because promotion needs the host
+# to resolve the domain and reach the first DC, and before credential_setup,
+# because promotion turns the host's local groups into domain groups.
+# ---------------------------------------------------------------------------
+
+resource "aws_ssm_document" "promote_dc" {
+  name            = "${try(local.aws_config.name_prefix, "msad")}-promote-dc"
+  document_type   = "Command"
+  document_format = "JSON"
+
+  content = jsonencode({
+    schemaVersion = "2.2"
+    description   = "Promote an additional domain controller into the existing domain"
+    parameters = {
+      DomainFqdn   = { type = "String" }
+      AdminUser    = { type = "String" }
+      AdminPass    = { type = "String" }
+      SafeModePass = { type = "String" }
+    }
+    mainSteps = [{
+      action = "aws:runPowerShellScript"
+      name   = "PromoteDomainController"
+      inputs = {
+        runCommand = [
+          "$ErrorActionPreference = 'Stop'",
+          "",
+          "# Idempotency: DomainRole 4 (backup DC) or 5 (primary DC) means this host",
+          "# is already promoted. 3 is a member server, which is what we start from.",
+          "$domainRole = (Get-CimInstance Win32_ComputerSystem).DomainRole",
+          "if ($domainRole -ge 4) { Write-Host \"Already a domain controller (DomainRole=$domainRole), skipping\"; exit 0 }",
+          "",
+          "# Wait for an existing DC to be reachable. Promotion locates one through",
+          "# the same SRV record the domain join uses, so poll it the same way.",
+          "$srvName = '_ldap._tcp.dc._msdcs.{{ DomainFqdn }}'",
+          "$timeout = 600; $elapsed = 0; $found = $false",
+          "while ($elapsed -lt $timeout) {",
+          "    try {",
+          "        $srv = Resolve-DnsName $srvName -Type SRV -ErrorAction Stop",
+          "        Write-Host \"DC SRV record found: $($srv[0].NameTarget)\"",
+          "        $found = $true",
+          "        break",
+          "    } catch {",
+          "        Write-Host \"Waiting for DC SRV record ($srvName)... ($elapsed s)\"",
+          "        Start-Sleep 15",
+          "        $elapsed += 15",
+          "        try { Clear-DnsClientCache } catch {}",
+          "    }",
+          "}",
+          "if (-not $found) { throw \"DC SRV record $srvName not found after $${timeout}s\" }",
+          "",
+          "# AD DS binaries come from the install_features phase for dc hosts, but do",
+          "# not assume it: a config edited from srv to dc would not have them yet.",
+          "if ((Get-WindowsFeature -Name AD-Domain-Services).InstallState -ne 'Installed') { Install-WindowsFeature -Name AD-Domain-Services -IncludeManagementTools | Out-Null }",
+          "Import-Module ADDSDeployment",
+          "",
+          "$safe = ConvertTo-SecureString '{{ SafeModePass }}' -AsPlainText -Force",
+          "$sec = ConvertTo-SecureString '{{ AdminPass }}' -AsPlainText -Force",
+          "$cred = New-Object System.Management.Automation.PSCredential('{{ AdminUser }}', $sec)",
+          "",
+          "# -InstallDns makes this DC a DNS server; the AD-integrated zones arrive as",
+          "# part of replication. Promotion reboots on completion, exactly like the",
+          "# forest creation on the bootstrap host does.",
+          "Install-ADDSDomainController -DomainName '{{ DomainFqdn }}' -Credential $cred -SafeModeAdministratorPassword $safe -InstallDns -Force:$true -NoRebootOnCompletion:$false"
+        ]
+      }
+    }]
+  })
+}
+
+resource "aws_ssm_association" "promote_dc" {
+  for_each = {
+    for name, vm in aws_instance.nodes : name => vm if contains(local.promotable_dc_hosts, name)
+  }
+
+  name = aws_ssm_document.promote_dc.name
+
+  targets {
+    key    = "InstanceIds"
+    values = [each.value.id]
+  }
+
+  parameters = {
+    DomainFqdn   = local.domain.fqdn
+    AdminUser    = local.domain.admin_user
+    AdminPass    = local.domain_admin_password
+    SafeModePass = local.safe_mode_password
+  }
+
+  dynamic "output_location" {
+    for_each = local.ssm_logs_enabled ? [1] : []
+    content {
+      s3_bucket_name = local.ssm_log_bucket
+      s3_key_prefix  = "${local.ssm_log_prefix}/promote-dc/${each.key}"
+    }
+  }
+
+  # SRV wait (600s) + promotion + reboot + AD DS startup.
+  wait_for_success_timeout_seconds = 1800
+
+  depends_on = [time_sleep.wait_for_join_reboot]
+}
+
+resource "time_sleep" "wait_for_promotion" {
+  # Only exists when there is something to promote, so a single-DC setup does not
+  # pay this wait on every apply.
+  count = length(local.promotable_dc_hosts) > 0 ? 1 : 0
+
+  # A promoted DC needs longer than a plain reboot: AD DS has to start, SYSVOL has
+  # to finish its initial DFSR sync, and the local-to-domain group conversion has
+  # to settle before credential_setup touches group membership.
+  create_duration = "240s"
+
+  triggers = {
+    promotion_ids = join(",", sort([for k, v in aws_ssm_association.promote_dc : v.association_id]))
+  }
+
+  depends_on = [aws_ssm_association.promote_dc]
+}
+
+# ---------------------------------------------------------------------------
+# Phase: Re-assert DNS on a freshly promoted DC
+#
+# Promotion installs the DNS role on the new DC and can repoint its resolver at
+# itself. On its own that breaks name resolution for the AWS SSM endpoints, since
+# an AD DNS server in a private subnet has no route to the root hints — which is
+# exactly why the bootstrap DC gets a VPC forwarder. The forwarder association
+# cannot simply cover both: join_domain depends on it, so making it wait for
+# promotion would close a dependency cycle. Hence a second, later phase.
+# ---------------------------------------------------------------------------
+
+resource "aws_ssm_document" "configure_promoted_dc" {
+  name            = "${try(local.aws_config.name_prefix, "msad")}-promoted-dc-dns"
+  document_type   = "Command"
+  document_format = "JSON"
+
+  content = jsonencode({
+    schemaVersion = "2.2"
+    description   = "Re-assert resolver list and VPC forwarder on a promoted DC"
+    parameters = {
+      DnsList = { type = "String" }
+      VpcDns  = { type = "String" }
+    }
+    mainSteps = [{
+      action = "aws:runPowerShellScript"
+      name   = "ConfigurePromotedDcDns"
+      inputs = {
+        runCommand = [
+          "$ErrorActionPreference = 'Stop'",
+          "",
+          "# Put the resolver list back to the configured servers, with this DC first",
+          "# so it answers for the domain, and the VPC resolver retained as fallback.",
+          "$adapter = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' } | Select-Object -First 1",
+          "if ($adapter) {",
+          "    $servers = @('127.0.0.1') + ('{{ DnsList }}'.Split(',') | Where-Object { $_ -ne '127.0.0.1' })",
+          "    Set-DnsClientServerAddress -InterfaceIndex $adapter.IfIndex -ServerAddresses $servers",
+          "    Write-Host \"Resolver list set to: $($servers -join ', ')\"",
+          "}",
+          "",
+          "# Same VPC forwarder the bootstrap DC gets, so AWS endpoints resolve from",
+          "# this DC's own DNS service.",
+          "$existing = Get-DnsServerForwarder -ErrorAction SilentlyContinue | Select-Object -ExpandProperty IPAddress | ForEach-Object { $_.IPAddressToString }",
+          "if ('{{ VpcDns }}' -notin $existing) { Add-DnsServerForwarder -IPAddress '{{ VpcDns }}' -PassThru | Out-Null; Write-Host 'VPC DNS forwarder added' } else { Write-Host 'VPC DNS forwarder already present' }",
+          "",
+          "try { Clear-DnsClientCache } catch {}",
+          "$dc = Get-ADDomainController -Identity $env:COMPUTERNAME -ErrorAction Stop",
+          "Write-Host \"Promoted DC confirmed: $($dc.HostName), site $($dc.Site), GC=$($dc.IsGlobalCatalog)\""
+        ]
+      }
+    }]
+  })
+}
+
+resource "aws_ssm_association" "configure_promoted_dc" {
+  for_each = {
+    for name, vm in aws_instance.nodes : name => vm if contains(local.promotable_dc_hosts, name)
+  }
+
+  name = aws_ssm_document.configure_promoted_dc.name
+
+  targets {
+    key    = "InstanceIds"
+    values = [each.value.id]
+  }
+
+  parameters = {
+    DnsList = join(",", distinct(concat(local.dns_servers, [local.vpc_dns])))
+    VpcDns  = local.vpc_dns
+  }
+
+  dynamic "output_location" {
+    for_each = local.ssm_logs_enabled ? [1] : []
+    content {
+      s3_bucket_name = local.ssm_log_bucket
+      s3_key_prefix  = "${local.ssm_log_prefix}/promoted-dc-dns/${each.key}"
+    }
+  }
+
+  wait_for_success_timeout_seconds = 600
+
+  depends_on = [time_sleep.wait_for_promotion]
+}
+
 resource "aws_ssm_document" "join_domain" {
   name            = "${try(local.aws_config.name_prefix, "msad")}-join-domain"
   document_type   = "Command"
@@ -834,11 +1051,11 @@ resource "aws_ssm_document" "credential_setup" {
     schemaVersion = "2.2"
     description   = "Create service user and required remoting permissions"
     parameters = {
-      Username     = { type = "String" }
-      Password     = { type = "String" }
-      DomainFqdn   = { type = "String" }
-      TrustedHosts = { type = "String" }
-      IsBootstrap  = { type = "String", default = "false" }
+      Username           = { type = "String" }
+      Password           = { type = "String" }
+      DomainFqdn         = { type = "String" }
+      TrustedHosts       = { type = "String" }
+      IsDomainController = { type = "String", default = "false" }
     }
     mainSteps = [{
       action = "aws:runPowerShellScript"
@@ -849,10 +1066,11 @@ resource "aws_ssm_document" "credential_setup" {
           "$username = '{{ Username }}'",
           "$upn = \"$username@{{ DomainFqdn }}\"",
           "$password = ConvertTo-SecureString '{{ Password }}' -AsPlainText -Force",
-          "$isBootstrap = '{{ IsBootstrap }}' -eq 'true'",
+          "$isDc = '{{ IsDomainController }}' -eq 'true'",
           "",
-          "# AD user creation — only on the DC (bootstrap host)",
-          "if ($isBootstrap) {",
+          "# AD user creation — only on a domain controller. Runs on every DC: the",
+          "# guards below make it a no-op once the first one has created the user.",
+          "if ($isDc) {",
           "  # Complete DHCP post-install: create security groups and authorize in AD",
           "  netsh dhcp add securitygroups 2>&1 | Write-Host",
           "  Restart-Service dhcpserver -Force -ErrorAction SilentlyContinue",
@@ -885,7 +1103,7 @@ resource "aws_ssm_document" "credential_setup" {
           "# Add service user to local Remote Management Users group (non-DC hosts only; on DCs this is an AD group already handled above)",
           "$domainPrefix = '{{ DomainFqdn }}'.Split('.')[0].ToUpper()",
           "$localAccount = \"$domainPrefix\\$username\"",
-          "if (-not $isBootstrap) { for ($attempt = 1; $attempt -le 12; $attempt++) { try { Add-LocalGroupMember -Group 'Remote Management Users' -Member $localAccount -ErrorAction Stop; Write-Host \"Added $localAccount to local Remote Management Users on $(hostname)\"; break } catch { if ($_.Exception.Message -match 'already a member') { Write-Host \"$localAccount already in local Remote Management Users\"; break } elseif ($_.Exception.Message -match 'not found|PrincipalNotFound' -and $attempt -lt 12) { Write-Host \"Retry $attempt/12: $localAccount not resolvable yet, waiting 15s...\"; Start-Sleep -Seconds 15 } else { throw } } } } else { Write-Host 'DC host — Remote Management Users is an AD group, already configured' }",
+          "if (-not $isDc) { for ($attempt = 1; $attempt -le 12; $attempt++) { try { Add-LocalGroupMember -Group 'Remote Management Users' -Member $localAccount -ErrorAction Stop; Write-Host \"Added $localAccount to local Remote Management Users on $(hostname)\"; break } catch { if ($_.Exception.Message -match 'already a member') { Write-Host \"$localAccount already in local Remote Management Users\"; break } elseif ($_.Exception.Message -match 'not found|PrincipalNotFound' -and $attempt -lt 12) { Write-Host \"Retry $attempt/12: $localAccount not resolvable yet, waiting 15s...\"; Start-Sleep -Seconds 15 } else { throw } } } } else { Write-Host 'DC host — Remote Management Users is an AD group, already configured' }",
           "",
           "# CredSSP, firewall, TrustedHosts — all server hosts",
           "Enable-WSManCredSSP -Role Server -Force",
@@ -913,7 +1131,7 @@ resource "aws_ssm_document" "credential_setup" {
           "Write-Host \"[WMI] domainPrefix=$domainPrefix username=$username hostname=$(hostname)\"",
           "foreach ($ns in @('Root/Microsoft/Windows/DNS')) { Set-WmiNamespaceSecurity $ns \"$domainPrefix\\$username\"; Set-WmiNamespaceSecurity $ns \"$domainPrefix\\DNSAdmins\"; Write-Host \"WMI: $username + DNSAdmins granted on $ns\" }",
           "try { foreach ($acct in @(\"$domainPrefix\\$username\", \"$domainPrefix\\DNSAdmins\")) { Set-WmiNamespaceSecurity 'Root/Microsoft/Windows/DHCP' $acct }; Write-Host \"WMI: $username + DNSAdmins granted on Root/Microsoft/Windows/DHCP\" } catch { Write-Host \"DHCP WMI namespace not available, skipping: $($_.Exception.Message)\" }",
-          "if ($isBootstrap) {",
+          "if ($isDc) {",
           "  $u = Get-ADUser -Identity $username -Properties MemberOf,UserPrincipalName,Enabled,WhenCreated",
           "  Write-Host '--- User Details ---'",
           "  Write-Host \"  SAM Account : $($u.SamAccountName)\"",
@@ -947,7 +1165,10 @@ resource "aws_ssm_association" "credential_setup" {
     Password     = local.service_user_password
     DomainFqdn   = local.domain.fqdn
     TrustedHosts = join(",", [for name in local.server_hosts : local.effective_ip_by_host[name]])
-    IsBootstrap  = each.key == local.bootstrap_host ? "true" : "false"
+    # Selects the AD-group path over the local-group path. Promoting a host to a
+    # DC converts its local groups into domain groups, so any additional DC has
+    # to take the same branch as the bootstrap host once promotion is wired up.
+    IsDomainController = contains(local.domain_controllers, each.key) ? "true" : "false"
   }
 
   dynamic "output_location" {
@@ -960,7 +1181,7 @@ resource "aws_ssm_association" "credential_setup" {
 
   wait_for_success_timeout_seconds = 600
 
-  depends_on = [time_sleep.wait_for_join_reboot]
+  depends_on = [time_sleep.wait_for_join_reboot, time_sleep.wait_for_promotion, aws_ssm_association.configure_promoted_dc]
 }
 
 resource "time_sleep" "wait_for_join_reboot" {
