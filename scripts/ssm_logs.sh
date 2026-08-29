@@ -34,6 +34,8 @@ PHASES=(
   bootstrap-domain
   dns-forwarder
   join-domain
+  promote-dc
+  promoted-dc-dns
   credential-setup
   agent-setup
 )
