@@ -252,6 +252,14 @@ Each `time_sleep` keys its `triggers` off the association IDs of the phase befor
 
 For all targets that accept `[setup]`, pass it as a positional arg (`make apply nstarqa`) or as `SETUP=nstarqa`.
 
+`make apply` runs Terraform at `-parallelism=5` rather than the default 10. Adding a
+host changes a parameter on **every** existing SSM association — `TrustedHosts`
+carries every server IP, `DhcpServers` every server — so Terraform fires that many
+concurrent `UpdateAssociation` calls, and SSM rejects some with `TooManyUpdates`,
+failing the apply partway through. Raise it with `PARALLELISM=10 make apply <setup>`
+for a first apply, where there are no associations to update yet and the throttle
+only slows the build down.
+
 ## IP Pinning
 
 **Run `make lock-ips <setup>` after the first apply, and again after adding hosts.** Without it, changing the host list rebuilds the whole setup.

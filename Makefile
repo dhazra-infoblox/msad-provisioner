@@ -88,8 +88,14 @@ validate: ensure-workspace
 plan: ensure-workspace
 	terraform -chdir=$(TF_DIR) plan $(TF_VARS)
 
+# Terraform's default parallelism of 10 issues enough concurrent UpdateAssociation
+# calls to trip SSM's TooManyUpdates limit, because adding one host changes a
+# parameter (TrustedHosts, DhcpServers) on every existing association. Raise it
+# with PARALLELISM=10 for a first apply, where there is nothing to update yet.
+PARALLELISM ?= 5
+
 apply: ensure-workspace
-	terraform -chdir=$(TF_DIR) apply $(TF_VARS) --auto-approve
+	terraform -chdir=$(TF_DIR) apply $(TF_VARS) -parallelism=$(PARALLELISM) --auto-approve
 
 destroy: ensure-workspace
 	terraform -chdir=$(TF_DIR) destroy $(TF_VARS) --auto-approve
