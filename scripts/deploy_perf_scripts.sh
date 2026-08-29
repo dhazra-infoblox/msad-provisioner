@@ -2,7 +2,7 @@
 # deploy_perf_scripts.sh
 #
 # Uploads performance testing scripts to S3 and deploys them via SSM:
-#   - scripts/bulk_dhcp_load.ps1  → all server hosts, role srv (C:\ProgramData\msad-agent\)
+#   - scripts/bulk_dhcp_load.ps1  → all server hosts, roles srv and dc (C:\ProgramData\msad-agent\)
 #   - scripts/performance.ps1     → all agent clients, role clt (C:\Users\MSADAgent\)
 #
 # Usage:
@@ -148,7 +148,7 @@ SERVER_INSTANCES=$(python3 -c "
 import json, sys
 inv = json.load(sys.stdin)
 for name, h in inv.items():
-    if h.get('role') in ('srv', 'dhcp_server'):
+    if h.get('role') in ('srv', 'dc', 'dhcp_server', 'domain_controller'):
         print(f\"{name}={h['instance_id']}\")
 " <<< "$INVENTORY_JSON")
 
@@ -161,7 +161,7 @@ for name, h in inv.items():
 " <<< "$INVENTORY_JSON")
 
 if [ -z "$SERVER_INSTANCES" ]; then
-  warn "No server hosts (role srv) found in inventory."
+  warn "No server hosts (roles srv/dc) found in inventory."
 fi
 if [ -z "$AGENT_INSTANCES" ]; then
   warn "No agent client hosts (role clt) found in inventory."
