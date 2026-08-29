@@ -91,6 +91,60 @@ Get-PolicyFileEntry -Path "$env:SystemRoot\System32\GroupPolicy\Machine\Registry
 
 Verify via WMI Control (`wmimgmt.msc`) → Properties → Security tab → navigate to `Root\Microsoft\Windows\DNS` or `DHCP`. The service user and DNSAdmins should have **Enable Account**, **Execute Methods**, and **Remote Enable** checked.
 
+## Server Manager still prompts "Complete DHCP configuration"
+
+`credential_setup` does the whole post-install: it creates the DHCP security
+groups, authorizes every server in AD, and writes the Server Manager completion
+flag (`HKLM:\SOFTWARE\Microsoft\ServerManager\Roles\12` → `ConfigurationState = 2`).
+A host still showing the yellow post-deployment flag has not run the current
+version of that phase.
+
+The fix is a normal apply — the phase re-runs on every server host and is
+idempotent:
+
+```bash
+make apply <setup>
+```
+
+To clear the flag on a running fleet without a full apply, one SSM command covers
+every host at once. No RDP session, no per-server login:
+
+```bash
+SETUP=dctest
+cat > /tmp/fix-dhcp-flag.json <<'JSON'
+{
+  "commands": [
+    "$k = 'HKLM:\\SOFTWARE\\Microsoft\\ServerManager\\Roles\\12'",
+    "if (Test-Path $k) { Set-ItemProperty -Path $k -Name ConfigurationState -Value 2 -Force; Write-Host \"cleared on $env:COMPUTERNAME\" } else { Write-Host 'DHCP role not installed here' }"
+  ]
+}
+JSON
+
+IDS=$(TF_WORKSPACE=$SETUP terraform -chdir=terraform output -json host_inventory \
+  | jq -r 'to_entries[] | select(.value.role != "clt") | .value.instance_id')
+
+aws ssm send-command --profile <profile> --region <region> \
+  --document-name AWS-RunPowerShellScript \
+  --instance-ids $IDS \
+  --parameters file:///tmp/fix-dhcp-flag.json
+```
+
+## DHCP server not serving leases
+
+An unauthorized DHCP server starts but refuses to hand out addresses. Check the
+AD-side authorization list from any domain-joined host:
+
+```powershell
+Get-DhcpServerInDC
+```
+
+Every `srv` and `dc` host in the setup should appear. Authorization is performed
+by the **bootstrap host** for the whole setup, not by each server for itself: SSM
+runs as SYSTEM, and a member server's machine account has no rights on the
+NetServices container in AD. So a missing entry means the bootstrap host's
+`credential_setup` run is the one to look at, not the affected server's — that run
+fails outright if any server is left unauthorized.
+
 ## IMDS unreachable after static IP
 
 The networking step adds a route for `169.254.169.254`. Verify it exists:

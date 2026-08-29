@@ -1183,6 +1183,7 @@ resource "aws_ssm_document" "credential_setup" {
       DomainFqdn         = { type = "String" }
       TrustedHosts       = { type = "String" }
       IsDomainController = { type = "String", default = "false" }
+      DhcpServers        = { type = "String", default = "none" }
     }
     mainSteps = [{
       action = "aws:runPowerShellScript"
@@ -1195,30 +1196,70 @@ resource "aws_ssm_document" "credential_setup" {
           "$password = ConvertTo-SecureString '{{ Password }}' -AsPlainText -Force",
           "$isDc = '{{ IsDomainController }}' -eq 'true'",
           "",
+          "# --- DHCP post-install ------------------------------------------------",
+          "# Every host this phase targets carries the DHCP role, so this runs on all",
+          "# of them. Server Manager's post-deployment wizard does three things: create",
+          "# the security groups, authorize the server in AD, and write a completion",
+          "# flag. Doing only the first two leaves every host prompting for a manual",
+          "# click-through, which does not scale past a handful of servers.",
+          "netsh dhcp add securitygroups 2>&1 | Write-Host",
+          "Write-Host 'DHCP security groups created (DHCP Administrators, DHCP Users)'",
+          "",
+          "# Authorization is written to AD by the bootstrap host on behalf of the whole",
+          "# setup. SSM runs as SYSTEM, and a member server's machine account has no",
+          "# rights on the NetServices container, so a host that authorizes itself only",
+          "# succeeds when it is a DC. DhcpServers is 'none' on every other host.",
+          "$toAuthorize = @('{{ DhcpServers }}'.Split(',') | Where-Object { $_ -and $_ -ne 'none' })",
+          "foreach ($entry in $toAuthorize) {",
+          "  $parts = $entry.Split('=')",
+          "  $dhcpFqdn = \"$($parts[0]).{{ DomainFqdn }}\"",
+          "  if (-not (Get-DhcpServerInDC | Where-Object { $_.DnsName -eq $dhcpFqdn })) { Add-DhcpServerInDC -DnsName $dhcpFqdn -IPAddress $parts[1]; Write-Host \"Authorized $dhcpFqdn ($($parts[1])) in AD\" } else { Write-Host \"$dhcpFqdn already authorized\" }",
+          "}",
+          "# Verify rather than trust the call: authorization used to be wrapped in a",
+          "# catch that only warned, so a DHCP server that never got authorized still",
+          "# left this phase green while being unable to serve leases.",
+          "if ($toAuthorize) {",
+          "  $authorized = @((Get-DhcpServerInDC).DnsName)",
+          "  $missing = @($toAuthorize | ForEach-Object { \"$($_.Split('=')[0]).{{ DomainFqdn }}\" } | Where-Object { $authorized -notcontains $_ })",
+          "  if ($missing) { throw \"DHCP servers not authorized in AD: $($missing -join ', ')\" }",
+          "  Write-Host \"All $($toAuthorize.Count) DHCP servers authorized in AD\"",
+          "}",
+          "",
+          "# Clear the Server Manager post-deployment prompt (Roles\\12 is DHCP Server).",
+          "# Without this flag the wizard keeps asking on every host even though the work",
+          "# above has already been done, which is what forced a manual login per server.",
+          "$dhcpRoleKey = 'HKLM:\\SOFTWARE\\Microsoft\\ServerManager\\Roles\\12'",
+          "if (Test-Path $dhcpRoleKey) { Set-ItemProperty -Path $dhcpRoleKey -Name ConfigurationState -Value 2 -Force; Write-Host 'DHCP post-deployment configuration marked complete' } else { Write-Host \"Server Manager DHCP role key $dhcpRoleKey not found - skipping completion flag\" }",
+          "",
+          "# Restart DHCP last, so the service comes up having picked up both the",
+          "# security groups created above and its AD authorization. A non-bootstrap",
+          "# host is authorized by the bootstrap host's run of this same phase, which",
+          "# runs in parallel, so wait briefly for that to land first: a service that",
+          "# starts unauthorized refuses to serve leases until the next rogue-detection",
+          "# sweep, an hour later by default.",
+          "$myFqdn = \"$env:COMPUTERNAME.{{ DomainFqdn }}\"",
+          "if (-not $toAuthorize) {",
+          "  for ($attempt = 1; $attempt -le 18; $attempt++) {",
+          "    if (Get-DhcpServerInDC | Where-Object { $_.DnsName -eq $myFqdn }) { Write-Host \"$myFqdn is authorized in AD\"; break }",
+          "    # A warning, not a throw: the bootstrap host's own run fails outright if",
+          "    # authorization is genuinely broken, so failing here too would only turn",
+          "    # one clear failure into a fleet-wide cascade.",
+          "    if ($attempt -eq 18) { Write-Host \"Warning: $myFqdn still not authorized after 3 minutes - restarting anyway, check the bootstrap host's credential_setup run\" } else { Write-Host \"Waiting for the bootstrap host to authorize $myFqdn ($attempt/18)...\"; Start-Sleep -Seconds 10 }",
+          "  }",
+          "}",
+          "Restart-Service dhcpserver -Force",
+          "$dhcpSvc = Get-Service dhcpserver",
+          "if ($dhcpSvc.Status -ne 'Running') { throw \"DHCP Server service is $($dhcpSvc.Status) after restart on $(hostname)\" }",
+          "Write-Host \"DHCP Server service restarted and running on $(hostname)\"",
+          "",
           "# AD user creation — only on a domain controller. Runs on every DC: the",
           "# guards below make it a no-op once the first one has created the user.",
           "if ($isDc) {",
-          "  # Complete DHCP post-install: create security groups and authorize in AD",
-          "  netsh dhcp add securitygroups 2>&1 | Write-Host",
-          "  Restart-Service dhcpserver -Force -ErrorAction SilentlyContinue",
-          "  $fqdn = \"$env:COMPUTERNAME.{{ DomainFqdn }}\"",
-          "  $ip = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.PrefixOrigin -ne 'WellKnown' } | Select-Object -First 1).IPAddress",
-          "  if (-not (Get-DhcpServerInDC | Where-Object { $_.DnsName -eq $fqdn })) { Add-DhcpServerInDC -DnsName $fqdn -IPAddress $ip; Write-Host \"DHCP server $fqdn authorized in AD\" } else { Write-Host \"DHCP server $fqdn already authorized\" }",
-          "  Write-Host 'DHCP security groups created (DHCP Administrators, DHCP Users)'",
           "  if (-not (Get-ADUser -Filter \"UserPrincipalName -eq '$upn'\" -ErrorAction SilentlyContinue)) { New-ADUser -Name $username -SamAccountName $username -UserPrincipalName $upn -AccountPassword $password -Enabled $true; Write-Host \"Created user $upn\" } else { Write-Host \"User $upn already exists\" }",
           "  foreach ($grp in @('Domain Users','Remote Management Users','DNSAdmins','DHCP Administrators')) { try { Add-ADGroupMember -Identity $grp -Members $username -ErrorAction Stop; Write-Host \"Added to $grp\" } catch { if ($_.Exception.Message -match 'already a member') { Write-Host \"Already in $grp\" } elseif ($_.Exception.Message -match 'Cannot find an object with identity') { Write-Host \"Group $grp not found, skipping\" } else { throw } } }",
           "} else {",
-          "  Write-Host \"Non-DC host — creating DHCP security groups and authorizing in AD\"",
-          "  netsh dhcp add securitygroups 2>&1 | Write-Host",
-          "  Restart-Service dhcpserver -Force -ErrorAction SilentlyContinue",
-          "  Write-Host 'DHCP security groups created (DHCP Administrators, DHCP Users)'",
-          "  # Authorize this DHCP server in AD (requires domain cred)",
-          "  $secPass = ConvertTo-SecureString '{{ Password }}' -AsPlainText -Force",
-          "  $domCred = New-Object System.Management.Automation.PSCredential('{{ Username }}@{{ DomainFqdn }}', $secPass)",
-          "  $fqdn = \"$env:COMPUTERNAME.{{ DomainFqdn }}\"",
-          "  $ip = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.PrefixOrigin -ne 'WellKnown' } | Select-Object -First 1).IPAddress",
-          "  try { if (-not (Get-DhcpServerInDC | Where-Object { $_.DnsName -eq $fqdn })) { Add-DhcpServerInDC -DnsName $fqdn -IPAddress $ip; Write-Host \"DHCP server $fqdn authorized in AD\" } else { Write-Host \"DHCP server $fqdn already authorized\" } } catch { Write-Host \"Warning: Could not authorize DHCP server in AD: $($_.Exception.Message)\" }",
-          "  # Add service user to local DHCP Administrators group",
+          "  # Add service user to the local DHCP Administrators group. On a DC this is",
+          "  # an AD group and is handled by the branch above.",
           "  $domainPrefix = '{{ DomainFqdn }}'.Split('.')[0].ToUpper()",
           "  $localAccount = \"$domainPrefix\\{{ Username }}\"",
           "  # A missing group means the DHCP role never installed - fail fast rather than",
@@ -1296,6 +1337,16 @@ resource "aws_ssm_association" "credential_setup" {
     # DC converts its local groups into domain groups, so any additional DC has
     # to take the same branch as the bootstrap host once promotion is wired up.
     IsDomainController = contains(local.domain_controllers, each.key) ? "true" : "false"
+    # Every DHCP server in the setup, authorized in AD by the bootstrap host alone.
+    # SSM runs as SYSTEM, so a member server cannot authorize itself: its machine
+    # account has no rights on the NetServices container. Doing it from one host
+    # also keeps the completeness check race-free, since the same run writes and
+    # verifies the whole list. "none" is a sentinel rather than an empty string,
+    # which SSM rejects as a parameter value.
+    DhcpServers = each.key == local.bootstrap_host ? join(",", [
+      for name in distinct(concat(local.server_hosts, [local.bootstrap_host])) :
+      "${name}=${local.effective_ip_by_host[name]}"
+    ]) : "none"
   }
 
   dynamic "output_location" {
@@ -1306,7 +1357,10 @@ resource "aws_ssm_association" "credential_setup" {
     }
   }
 
-  wait_for_success_timeout_seconds = 600
+  # 900 rather than the 600 used by the other phases: a non-bootstrap host may
+  # wait up to 3 minutes for the bootstrap host to authorize it in AD before it
+  # restarts the DHCP service, on top of this phase's existing retry loops.
+  wait_for_success_timeout_seconds = 900
 
   # Replacing an instance would otherwise leave this association in place and
   # merely update its targets. An update does not honour
