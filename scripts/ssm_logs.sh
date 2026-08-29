@@ -65,7 +65,9 @@ if [[ -z "$PHASE" ]]; then
   echo "SSM logs at ${S3_BASE}/"
   echo ""
   printf "%-25s %s\n" "PHASE" "FILES"
-  printf "%-25s %s\n" "─────" "─────"
+  # printf pads by bytes, and each box-drawing dash is 3 bytes in UTF-8, so a
+  # "%-25s" of them lands 10 columns short. Build the rule at the right width.
+  printf "%-25s %s\n" "$(printf '%.0s-' {1..21})" "-----"
   for p in "${PHASES[@]}"; do
     count=$( (aws s3 ls "${S3_BASE}/${p}/" --recursive "${AWS_OPTS[@]}" 2>/dev/null || true) | wc -l | tr -d ' ')
     if [[ "$count" -gt 0 ]]; then
