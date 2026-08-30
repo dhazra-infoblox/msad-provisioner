@@ -2,6 +2,13 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# Scaffold from config/template.yml when it exists. config/environment.yml is the
+# *default setup's* config, not a template — it describes running infrastructure,
+# so its AMI and subnet drift out of date and editing them to suit new setups
+# would force every instance in that setup to be replaced.
+if [ -z "${SOURCE_CONFIG:-}" ] && [ -f "$ROOT_DIR/config/template.yml" ]; then
+  SOURCE_CONFIG="$ROOT_DIR/config/template.yml"
+fi
 SOURCE_CONFIG="${SOURCE_CONFIG:-$ROOT_DIR/config/environment.yml}"
 SOURCE_SECRET="${SOURCE_SECRET:-$ROOT_DIR/terraform/secret.tfvars}"
 SETUP="${SETUP:-}"
@@ -175,8 +182,11 @@ if [ -n "$DCS" ] || [ -n "$SERVERS" ] || [ -n "$CLIENTS" ]; then
   source_sizing="$(role_sizing "$SOURCE_CONFIG")"
 
   count_role() { grep -c "^$1	" <<< "$source_sizing" || true; }
+  # SERVERS is the number of server machines in total. DCS says how many of them
+  # are domain controllers, so the two do not add up: a dc host runs DNS and DHCP
+  # exactly like an srv host, it is just also promoted.
   [ -n "$DCS" ]     || DCS="$(count_role dc)"
-  [ -n "$SERVERS" ] || SERVERS="$(count_role srv)"
+  [ -n "$SERVERS" ] || SERVERS="$(( $(count_role dc) + $(count_role srv) ))"
   [ -n "$CLIENTS" ] || CLIENTS="$(count_role clt)"
 
   for pair in "DCS:$DCS" "SERVERS:$SERVERS" "CLIENTS:$CLIENTS"; do
@@ -189,6 +199,12 @@ if [ -n "$DCS" ] || [ -n "$SERVERS" ] || [ -n "$CLIENTS" ]; then
   done
 
   [ "$DCS" -ge 1 ] || fail "DCS must be at least 1 — the bootstrap host is a domain controller"
+  [ "$DCS" -le "$SERVERS" ] \
+    || fail "DCS ($DCS) cannot exceed SERVERS ($SERVERS) — domain controllers are server machines, so SERVERS counts them"
+
+  # Whatever is left over after the domain controllers runs as a plain member
+  # server.
+  MEMBER_SERVERS=$((SERVERS - DCS))
 
   # Sizing for each generated role comes from the first host of that role in the
   # source config, so instance types stay defined in one place.
@@ -335,7 +351,7 @@ if [ "$GENERATE_HOSTS" = 1 ]; then
         emit_host "$(printf '%s-dc%02d' "$PREFIX" "$i")" dc no
       fi
     done
-    for ((i = 1; i <= SERVERS; i++)); do
+    for ((i = 1; i <= MEMBER_SERVERS; i++)); do
       emit_host "$(printf '%s-srv%02d' "$PREFIX" "$i")" srv no
     done
     for ((i = 1; i <= CLIENTS; i++)); do
@@ -381,7 +397,7 @@ echo "Copied secrets from: ${SOURCE_SECRET}"
 echo "Derived domain: ${DOMAIN}"
 echo "Derived host prefix: ${PREFIX} (e.g. ${PREFIX}-dc01, ${PREFIX}-srv01, ${PREFIX}-clt01)"
 if [ "$GENERATE_HOSTS" = 1 ]; then
-  echo "Generated hosts: ${DCS} dc, ${SERVERS} srv, ${CLIENTS} clt ($((DCS + SERVERS + CLIENTS)) total)"
+  echo "Generated hosts: ${SERVERS} servers (${DCS} dc + ${MEMBER_SERVERS} srv) + ${CLIENTS} clt = $((SERVERS + CLIENTS)) instances"
 fi
 echo "Derived ip_start_offset: ${IP_OFFSET}"
 echo "Next steps:"

@@ -151,31 +151,50 @@ Still open: removing a `dc` host from a live config destroys the instance withou
 
 ## Setup Size
 
-`make create-setup` mirrors the source config's host list by default — one `dc`,
-one `srv`, one `clt`. Pass any of `DCS`, `SERVERS` or `CLIENTS` to generate a given
-number of hosts per role instead:
+`make create-setup` mirrors the template's host list by default — one `dc`, one
+`srv`, one `clt`. Pass any of `SERVERS`, `DCS` or `CLIENTS` to generate a given
+number of hosts instead:
 
 ```bash
-make create-setup SETUP=perf20 SERVERS=20 CLIENTS=3   # 1 dc + 20 srv + 3 clt
-make create-setup SETUP=tri DCS=3 SERVERS=2           # 3 dc + 2 srv + 1 clt
+make create-setup SETUP=perf20 SERVERS=20 DCS=3 CLIENTS=3
+  # 20 servers (3 dc + 17 srv) + 3 clt = 23 instances
 ```
 
-- Counts left unset fall back to however many hosts of that role the source config
-  has, so `SERVERS=20` alone keeps the usual single DC and single client.
-- `DCS` counts the bootstrap host, so it must be at least 1. The first `dc` host is
-  the bootstrap host; the rest are promoted by the `promote_dc` phase.
-- Hosts are named `<prefix>-dc01`, `<prefix>-srv01` … `<prefix>-srv20`,
-  `<prefix>-clt01` …. Two digits is the limit, so no count may exceed 99.
+**`SERVERS` is the total number of server machines, and `DCS` is carved out of
+it** — the two do not add up. A `dc` host runs DNS and DHCP exactly like an `srv`
+host; it is just also promoted to a domain controller. So `SERVERS=20 DCS=3` gives
+you 20 DHCP/DNS servers, three of which are DCs, not 23.
+
+- Counts left unset fall back to the template's counts for that role.
+- `DCS` must be at least 1 (the bootstrap host is a DC) and at most `SERVERS`.
+- Hosts are named `<prefix>-dc01`…, `<prefix>-srv01`…, `<prefix>-clt01`…. Two
+  digits is the limit, so no count may exceed 99.
 - `instance_type` and `disk_gb` for each role come from the first host of that role
-  in the source config, so sizing stays defined in one place.
+  in the template, so sizing stays defined in one place.
 - No `ip:` fields are written. Run `make lock-ips <setup>` after the first apply.
+
+`SERVERS` is also what drives every per-server fan-out: `TrustedHosts`, the
+`DhcpServers` authorization list, each client's `server-targets.json`, the perf
+script deployment, and the number of SSM associations updated whenever you add a
+host.
+
+### The scaffolding template
+
+`create-setup` reads `config/template.yml` when it exists, falling back to
+`config/environment.yml`. Keep the template's `default_ami_id`, `subnet_id` and
+`vpc_id` current — they are what every new setup inherits.
+
+Do not use `config/environment.yml` as the place to update those. It is the
+**default setup's own config**, describing running infrastructure; changing its AMI
+or subnet forces every instance in that setup to be replaced on the next apply.
+Pass `SOURCE_CONFIG=<path>` to scaffold from a specific config instead.
 
 `ip_start_offset` is derived from every existing setup's actual footprint
 (`ip_start_offset` + host count) plus a gap of 10, so a large setup does not
 overlap the next one's range. Pass `IP_OFFSET=` to choose it yourself.
 
 Budget the apply time: every SSM phase fans out per host, and `make apply` runs at
-`-parallelism=5` (see Make Targets), so a 24-host setup works through each phase in
+`-parallelism=5` (see Make Targets), so a 23-host setup works through each phase in
 batches of five.
 
 ## Host Naming
@@ -264,7 +283,7 @@ Each `time_sleep` keys its `triggers` off the association IDs of the phase befor
 | `make login` | AWS SSO login |
 | `make init` | Terraform init |
 | `make create-setup SETUP=name` | Scaffold a new named setup |
-| `make create-setup SETUP=name SERVERS=20 CLIENTS=3` | …with a given number of hosts per role |
+| `make create-setup SETUP=name SERVERS=20 DCS=3 CLIENTS=3` | …with a given number of hosts (see Setup Size) |
 | `make validate [setup]` | Terraform validate |
 | `make plan [setup]` | Terraform plan |
 | `make apply [setup]` | Deploy everything |
