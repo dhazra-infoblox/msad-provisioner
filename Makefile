@@ -72,10 +72,17 @@ login:
 init:
 	terraform -chdir=$(TF_DIR) init
 
+# Host counts are optional. Passing any of DCS/SERVERS/CLIENTS generates that
+# many hosts per role instead of mirroring the source config's host list:
+#   make create-setup SETUP=perf20 SERVERS=20 CLIENTS=3
+DCS      ?=
+SERVERS  ?=
+CLIENTS  ?=
 create-setup:
 	@test "$(SETUP)" != "default" || (echo "SETUP must be set to a non-default setup name" >&2; exit 1)
 	@SETUP="$(SETUP)" DOMAIN="$(DOMAIN)" IP_OFFSET="$(IP_OFFSET)" \
 		NETBIOS="$(NETBIOS)" NAME_PREFIX="$(NAME_PREFIX)" PREFIX="$(PREFIX)" \
+		DCS="$(DCS)" SERVERS="$(SERVERS)" CLIENTS="$(CLIENTS)" \
 		bash ./scripts/create_setup.sh
 
 ensure-workspace:

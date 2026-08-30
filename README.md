@@ -149,6 +149,35 @@ Two consequences worth knowing:
 
 Still open: removing a `dc` host from a live config destroys the instance without demoting it, which leaves an orphaned DC object and stale SRV records in AD. See **[D4]** in [MULTI_DC_PLAN.md](MULTI_DC_PLAN.md). Full `make destroy` / `make redeploy` are unaffected — the whole domain goes with them.
 
+## Setup Size
+
+`make create-setup` mirrors the source config's host list by default — one `dc`,
+one `srv`, one `clt`. Pass any of `DCS`, `SERVERS` or `CLIENTS` to generate a given
+number of hosts per role instead:
+
+```bash
+make create-setup SETUP=perf20 SERVERS=20 CLIENTS=3   # 1 dc + 20 srv + 3 clt
+make create-setup SETUP=tri DCS=3 SERVERS=2           # 3 dc + 2 srv + 1 clt
+```
+
+- Counts left unset fall back to however many hosts of that role the source config
+  has, so `SERVERS=20` alone keeps the usual single DC and single client.
+- `DCS` counts the bootstrap host, so it must be at least 1. The first `dc` host is
+  the bootstrap host; the rest are promoted by the `promote_dc` phase.
+- Hosts are named `<prefix>-dc01`, `<prefix>-srv01` … `<prefix>-srv20`,
+  `<prefix>-clt01` …. Two digits is the limit, so no count may exceed 99.
+- `instance_type` and `disk_gb` for each role come from the first host of that role
+  in the source config, so sizing stays defined in one place.
+- No `ip:` fields are written. Run `make lock-ips <setup>` after the first apply.
+
+`ip_start_offset` is derived from every existing setup's actual footprint
+(`ip_start_offset` + host count) plus a gap of 10, so a large setup does not
+overlap the next one's range. Pass `IP_OFFSET=` to choose it yourself.
+
+Budget the apply time: every SSM phase fans out per host, and `make apply` runs at
+`-parallelism=5` (see Make Targets), so a 24-host setup works through each phase in
+batches of five.
+
 ## Host Naming
 
 Windows caps a computer (NetBIOS) name at **15 characters**, which is the tightest constraint in the whole config. The convention is `<prefix>-<role>NN` — `dcNN`, `srvNN` or `cltNN` — where the prefix is an abbreviation of the setup name:
@@ -235,6 +264,7 @@ Each `time_sleep` keys its `triggers` off the association IDs of the phase befor
 | `make login` | AWS SSO login |
 | `make init` | Terraform init |
 | `make create-setup SETUP=name` | Scaffold a new named setup |
+| `make create-setup SETUP=name SERVERS=20 CLIENTS=3` | …with a given number of hosts per role |
 | `make validate [setup]` | Terraform validate |
 | `make plan [setup]` | Terraform plan |
 | `make apply [setup]` | Deploy everything |

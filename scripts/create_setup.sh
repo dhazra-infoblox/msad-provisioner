@@ -10,6 +10,9 @@ IP_OFFSET="${IP_OFFSET:-}"
 NETBIOS="${NETBIOS:-}"
 NAME_PREFIX="${NAME_PREFIX:-}"
 PREFIX="${PREFIX:-}"
+DCS="${DCS:-}"
+SERVERS="${SERVERS:-}"
+CLIENTS="${CLIENTS:-}"
 
 # Windows caps a computer (NetBIOS) name at 15 characters. Terraform enforces
 # this at plan time too; catching it here means a bad setup is never scaffolded.
@@ -20,24 +23,77 @@ fail() {
   exit 1
 }
 
+# Count the hosts in a config file.
+host_count() {
+  awk '
+    /^hosts:/ { in_hosts=1; next }
+    in_hosts && /^[^[:space:]]/ { in_hosts=0 }
+    in_hosts && /^[[:space:]]*-[[:space:]]*name:/ { count++ }
+    END { print count + 0 }
+  ' "$1"
+}
+
+# Pick a starting offset that clears every existing setup's address range.
+#
+# This reserves against each setup's actual footprint (offset + host count)
+# rather than assuming a fixed stride. The old flat "+20" silently overlapped
+# the next setup as soon as one grew past 20 hosts, which is exactly what
+# SERVERS=20 produces.
 next_ip_offset() {
-  local max_offset
+  local f offset count end highest=0
 
-  max_offset=$(awk '
-    /^network:/ { in_network=1; next }
-    in_network && /^[^[:space:]]/ { in_network=0 }
-    in_network && $1 == "ip_start_offset:" { print $2 }
-  ' "$ROOT_DIR"/config/*.yml 2>/dev/null | awk '
-    BEGIN { max = 0 }
-    /^[0-9]+$/ && $1 > max { max = $1 }
-    END { print max }
-  ')
+  for f in "$ROOT_DIR"/config/*.yml; do
+    [ -e "$f" ] || continue
 
-  if [ -z "$max_offset" ] || [ "$max_offset" -lt 10 ]; then
+    offset=$(awk '
+      /^network:/ { in_network=1; next }
+      in_network && /^[^[:space:]]/ { in_network=0 }
+      in_network && $1 == "ip_start_offset:" { print $2; exit }
+    ' "$f")
+    [[ "$offset" =~ ^[0-9]+$ ]] || continue
+
+    count=$(host_count "$f")
+    end=$((offset + count))
+    [ "$end" -gt "$highest" ] && highest=$end
+  done
+
+  if [ "$highest" -lt 10 ]; then
     echo 10
   else
-    echo $((max_offset + 20))
+    echo $((highest + 10))
   fi
+}
+
+# Emit "role<TAB>instance_type<TAB>disk_gb" for every host in a config, so a
+# generated setup inherits sizing from the source rather than hardcoding it.
+role_sizing() {
+  awk '
+    function value(line) {
+      sub(/^[^:]*:[[:space:]]*/, "", line)
+      gsub(/[[:space:]]+$/, "", line)
+      return line
+    }
+    function normalize(r) {
+      if (r == "dhcp_server") { return "srv" }
+      if (r == "agent_client") { return "clt" }
+      if (r == "domain_controller") { return "dc" }
+      return r
+    }
+    # The bootstrap host is a domain controller in fact, whatever the source
+    # config calls it — the host transform below rewrites it to dc, so the
+    # sizing lookup has to agree or a dc count of 0 falls out of a config whose
+    # bootstrap host is still declared srv.
+    function emit() { if (seen) { print (boot ? "dc" : normalize(role)) "\t" itype "\t" disk } }
+    /^hosts:/ { in_hosts=1; next }
+    in_hosts && /^[^[:space:]]/ { in_hosts=0 }
+    !in_hosts { next }
+    /^[[:space:]]*-[[:space:]]*name:/ { emit(); seen=1; role=""; itype=""; disk=""; boot=0; next }
+    /^[[:space:]]*bootstrap:[[:space:]]*true/ { boot=1; next }
+    /^[[:space:]]*role:/ { role = value($0); next }
+    /^[[:space:]]*instance_type:/ { itype = value($0); next }
+    /^[[:space:]]*disk_gb:/ { disk = value($0); next }
+    END { emit() }
+  ' "$1"
 }
 
 # Derive a short host-name prefix from the setup name. The abbreviation grows
@@ -107,6 +163,41 @@ prefix_budget=$((HOSTNAME_MAX_LENGTH - 6))
 
 if [ -z "$NAME_PREFIX" ]; then
   NAME_PREFIX="${SETUP}_msad"
+fi
+
+# Host counts. Passing any of DCS/SERVERS/CLIENTS switches from "mirror the
+# source config's host list" to "generate this many hosts per role"; the ones
+# left unset fall back to however many the source config has.
+GENERATE_HOSTS=0
+if [ -n "$DCS" ] || [ -n "$SERVERS" ] || [ -n "$CLIENTS" ]; then
+  GENERATE_HOSTS=1
+
+  source_sizing="$(role_sizing "$SOURCE_CONFIG")"
+
+  count_role() { grep -c "^$1	" <<< "$source_sizing" || true; }
+  [ -n "$DCS" ]     || DCS="$(count_role dc)"
+  [ -n "$SERVERS" ] || SERVERS="$(count_role srv)"
+  [ -n "$CLIENTS" ] || CLIENTS="$(count_role clt)"
+
+  for pair in "DCS:$DCS" "SERVERS:$SERVERS" "CLIENTS:$CLIENTS"; do
+    name="${pair%%:*}"
+    value="${pair#*:}"
+    [[ "$value" =~ ^[0-9]+$ ]] || fail "$name must be a number, got: $value"
+    # Two digits is all the <prefix>-srvNN form has room for once the 15-char
+    # computer name limit and the prefix budget are accounted for.
+    [ "$value" -le 99 ] || fail "$name must be 99 or fewer, got: $value"
+  done
+
+  [ "$DCS" -ge 1 ] || fail "DCS must be at least 1 — the bootstrap host is a domain controller"
+
+  # Sizing for each generated role comes from the first host of that role in the
+  # source config, so instance types stay defined in one place.
+  sizing_for() {
+    local role="$1" field="$2"
+    awk -F'\t' -v want="$role" -v field="$field" '
+      $1 == want && $field != "" { print $field; exit }
+    ' <<< "$source_sizing"
+  }
 fi
 
 TARGET_CONFIG="$ROOT_DIR/config/${SETUP}.yml"
@@ -219,6 +310,42 @@ function render_role(original, role) {
 }
 ' "$SOURCE_CONFIG" > "$TARGET_CONFIG"
 
+if [ "$GENERATE_HOSTS" = 1 ]; then
+  # Keep everything the transform produced down to the `hosts:` key — including
+  # the role documentation above it — and replace the host list itself.
+  awk '/^hosts:/ { print; exit } { print }' "$TARGET_CONFIG" > "$TARGET_CONFIG.tmp"
+
+  emit_host() {
+    local name="$1" role="$2" bootstrap="$3" itype disk
+    itype="$(sizing_for "$role" 2)"
+    disk="$(sizing_for "$role" 3)"
+
+    printf '  - name: %s\n    role: %s\n' "$name" "$role"
+    [ "$bootstrap" = "yes" ] && printf '    bootstrap: true\n'
+    [ -n "$itype" ] && printf '    instance_type: %s\n' "$itype"
+    [ -n "$disk" ] && printf '    disk_gb: %s\n' "$disk"
+    return 0
+  }
+
+  {
+    for ((i = 1; i <= DCS; i++)); do
+      if [ "$i" -eq 1 ]; then
+        emit_host "$(printf '%s-dc%02d' "$PREFIX" "$i")" dc yes
+      else
+        emit_host "$(printf '%s-dc%02d' "$PREFIX" "$i")" dc no
+      fi
+    done
+    for ((i = 1; i <= SERVERS; i++)); do
+      emit_host "$(printf '%s-srv%02d' "$PREFIX" "$i")" srv no
+    done
+    for ((i = 1; i <= CLIENTS; i++)); do
+      emit_host "$(printf '%s-clt%02d' "$PREFIX" "$i")" clt no
+    done
+  } >> "$TARGET_CONFIG.tmp"
+
+  mv "$TARGET_CONFIG.tmp" "$TARGET_CONFIG"
+fi
+
 # Final guards: the source config may carry suffixes longer than the dc01/srv01/
 # clt01 forms this script assumes, or names that collapse into a duplicate once
 # the bootstrap host is renamed. Measure what was actually written.
@@ -253,6 +380,9 @@ echo "Created terraform/secret.${SETUP}.tfvars"
 echo "Copied secrets from: ${SOURCE_SECRET}"
 echo "Derived domain: ${DOMAIN}"
 echo "Derived host prefix: ${PREFIX} (e.g. ${PREFIX}-dc01, ${PREFIX}-srv01, ${PREFIX}-clt01)"
+if [ "$GENERATE_HOSTS" = 1 ]; then
+  echo "Generated hosts: ${DCS} dc, ${SERVERS} srv, ${CLIENTS} clt ($((DCS + SERVERS + CLIENTS)) total)"
+fi
 echo "Derived ip_start_offset: ${IP_OFFSET}"
 echo "Next steps:"
 echo "  1. Review config/${SETUP}.yml"
