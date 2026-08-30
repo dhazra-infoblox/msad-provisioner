@@ -451,7 +451,7 @@ Script output goes to S3 (not Terraform stdout). Configure in your setup's YAML:
 ```yaml
 ssm_logs:
   s3_bucket: your-bucket
-  s3_prefix: ib-msad
+  s3_prefix: ssm-logs
 ```
 
 Browse logs with:

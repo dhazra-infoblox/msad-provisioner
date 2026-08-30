@@ -30,10 +30,30 @@ fi
 
 [ -f "$CONFIG_FILE" ] || { echo "ERROR: config not found: $CONFIG_FILE" >&2; exit 1; }
 
-AWS_PROFILE=$(python3 -c "import yaml; print(yaml.safe_load(open('$CONFIG_FILE'))['aws']['profile'])" 2>/dev/null || echo "dibya-aws")
-AWS_REGION=$(python3 -c "import yaml; print(yaml.safe_load(open('$CONFIG_FILE'))['aws'].get('region','us-east-1'))" 2>/dev/null || echo "us-east-1")
-S3_BUCKET=$(python3 -c "import yaml; c=yaml.safe_load(open('$CONFIG_FILE')); print(c.get('ssm_logs',{}).get('s3_bucket','cicd-blox'))" 2>/dev/null || echo "cicd-blox")
-S3_PREFIX=$(python3 -c "import yaml; c=yaml.safe_load(open('$CONFIG_FILE')); print(c.get('ssm_logs',{}).get('s3_prefix','ib-msad/ssm_logs'))" 2>/dev/null || echo "ib-msad/ssm_logs")
+# Read everything environment-specific from the config. This repo is public, so
+# no account, bucket or profile name belongs in a tracked file as a fallback.
+#
+# Parsed with awk rather than PyYAML, which is not a dependency of this repo and
+# is absent on at least some dev machines. The previous python one-liners failed
+# silently into hardcoded defaults, so this script never actually read the config.
+yaml_field() {
+  awk -v section="$1:" -v key="$2:" '
+    $0 == section { in_section = 1; next }
+    in_section && /^[^[:space:]]/ { in_section = 0 }
+    in_section && $1 == key { $1 = ""; sub(/^[[:space:]]+/, ""); print; exit }
+  ' "$CONFIG_FILE"
+}
+
+AWS_PROFILE=$(yaml_field aws profile)
+AWS_REGION=$(yaml_field aws region)
+S3_BUCKET=$(yaml_field ssm_logs s3_bucket)
+S3_PREFIX=$(yaml_field ssm_logs s3_prefix)
+
+AWS_REGION="${AWS_REGION:-us-east-1}"
+S3_PREFIX="${S3_PREFIX:-ssm-logs}"
+
+[ -n "$AWS_PROFILE" ] || { echo "ERROR: aws.profile is not set in $CONFIG_FILE" >&2; exit 1; }
+[ -n "$S3_BUCKET" ] || { echo "ERROR: ssm_logs.s3_bucket is not set in $CONFIG_FILE — it is needed to stage the scripts" >&2; exit 1; }
 
 # Script paths on target machines
 DHCP_SCRIPT_PATH="${DHCP_SCRIPT_PATH:-C:\\ProgramData\\msad-agent\\bulk_dhcp_load.ps1}"

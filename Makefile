@@ -64,7 +64,9 @@ help:
 	@echo "  make lock-ips [name] - stamp current IPs from Terraform state into config YAML"
 	@echo "                       - run after initial apply so future adds/removes don't shift existing hosts"
 
-AWS_PROFILE ?= $(shell python3 -c "import yaml; print(yaml.safe_load(open('$(CONFIG)'))['aws']['profile'])" 2>/dev/null || echo "dibya-aws")
+# Parsed with awk, not PyYAML, which is not a dependency of this repo. No
+# fallback value: this repo is public, so a real profile name does not belong here.
+AWS_PROFILE ?= $(shell awk '/^aws:/{a=1;next} a&&/^[^[:space:]]/{a=0} a&&$$1=="profile:"{print $$2; exit}' $(CONFIG) 2>/dev/null)
 
 login:
 	aws sso login --profile $(AWS_PROFILE)
