@@ -4,7 +4,7 @@
 #
 # Usage:
 #   ./scripts/creds.sh          # table of all hosts
-#   ./scripts/creds.sh dhcp01   # credentials for one host
+#   ./scripts/creds.sh sw-srv01 # credentials for one host
 set -euo pipefail
 
 TF_DIR="terraform"

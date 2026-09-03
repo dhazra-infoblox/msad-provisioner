@@ -23,15 +23,53 @@ locals {
 
   rdp_key_path = trimspace(var.key_pair_pem_path)
 
-  allowed_roles      = ["dhcp_server", "agent_client", "domain_controller"]
-  host_map           = { for h in local.hosts : h.name => h }
+  # Roles name what the host *is*, not one of the services it happens to run:
+  # a "srv" host carries AD, DNS and DHCP together. The longer names this tool
+  # started with are still accepted as aliases so configs written against the
+  # old schema keep working without an edit.
+  role_aliases = {
+    dhcp_server       = "srv"
+    agent_client      = "clt"
+    domain_controller = "dc"
+  }
+  allowed_roles = ["srv", "clt", "dc"]
+
+  # tostring(): a host named `01` or `12345` decodes out of YAML as a number,
+  # and length() rejects a number with an unhelpful type error long before the
+  # validation preconditions get a chance to explain the real problem.
+  config_host_names = [for h in local.hosts : tostring(h.name)]
+
+  # Keyed off distinct names so a duplicated host name lands on the validation
+  # precondition below instead of failing here with "Duplicate object key".
+  host_map = {
+    for name in distinct(local.config_host_names) :
+    name => [for h in local.hosts : h if tostring(h.name) == name][0]
+  }
+  host_roles         = { for name, h in local.host_map : name => try(local.role_aliases[h.role], h.role, "<missing>") }
   ordered_host_names = sort(keys(local.host_map))
 
-  bootstrap_hosts = [for h in local.hosts : h.name if try(h.bootstrap, false)]
+  bootstrap_hosts = [for h in local.hosts : tostring(h.name) if try(h.bootstrap, false)]
   bootstrap_host  = length(local.bootstrap_hosts) == 1 ? local.bootstrap_hosts[0] : ""
 
-  dhcp_hosts  = [for h in local.hosts : h.name if h.role == "dhcp_server"]
-  agent_hosts = [for h in local.hosts : h.name if h.role == "agent_client"]
+  # Kept in config order (not sorted) so the IP lists handed to TrustedHosts and
+  # the agent target list stay byte-identical across plans.
+  #
+  # A "dc" host runs DNS and DHCP too, so it belongs in this list alongside the
+  # member servers: it is a host the agent manages, not a different kind of thing.
+  server_host_roles = ["srv", "dc"]
+  server_hosts      = [for name in distinct(local.config_host_names) : name if contains(local.server_host_roles, local.host_roles[name])]
+  client_hosts      = [for name in distinct(local.config_host_names) : name if local.host_roles[name] == "clt"]
+
+  dc_hosts = [for name in distinct(local.config_host_names) : name if local.host_roles[name] == "dc"]
+
+  # The bootstrap host is promoted by bootstrap_domain (Install-ADDSForest); every
+  # other dc host is promoted by promote_dc (Install-ADDSDomainController). Both
+  # end up as real domain controllers, which is what credential_setup branches on.
+  promotable_dc_hosts = [for name in local.dc_hosts : name if name != local.bootstrap_host]
+  domain_controllers = distinct(concat(
+    local.bootstrap_host != "" ? [local.bootstrap_host] : [],
+    local.dc_hosts
+  ))
 
   subnet_prefix_len = tonumber(split("/", data.aws_subnet.selected.cidr_block)[1])
   host_space        = pow(2, 32 - local.subnet_prefix_len)
@@ -47,6 +85,14 @@ locals {
   # any host shifts the index → existing hosts get new IPs → forced EC2 replacement.
   pinned_ip_by_host = { for name, h in local.host_map : name => h.ip if can(h.ip) }
   unpinned_names    = [for name in local.ordered_host_names : name if !can(local.host_map[name].ip)]
+
+  # Copy-pasting a host block carries its `ip:` along, so two hosts can end up
+  # pinned to the same address. AWS only rejects that at RunInstances time, i.e.
+  # after the rest of the fleet is already built, so it is caught in the plan.
+  pinned_ips_duplicated = [
+    for ip in distinct(values(local.pinned_ip_by_host)) : ip
+    if length([for name, pinned in local.pinned_ip_by_host : name if pinned == ip]) > 1
+  ]
 
   # When every host is pinned there is nothing to auto-assign, so the subnet ENI
   # scan below is skipped entirely. That avoids a race where an ENI belonging to
@@ -74,6 +120,37 @@ locals {
   dns_servers = length(try(local.network.dns_servers, [])) > 0 ? local.network.dns_servers : [local.primary_dns]
   vpc_dns     = cidrhost(data.aws_vpc.selected.cidr_block, 2)
 
+  # Windows caps a computer (NetBIOS) name at 15 characters. A longer name only
+  # blows up in the rename phase, i.e. after the instance already exists, so the
+  # rules below are enforced with preconditions on terraform_data.validation
+  # (which fail `terraform plan`) instead of `check` blocks (which only warn).
+  hostname_max_length = 15
+  netbios_max_length  = 15
+
+  # Escape hatch for setups deployed before these rules existed: an over-length
+  # name can only be corrected by replacing the instance, and that should be a
+  # deliberate act, not something a routine plan forces on you. The structural
+  # rules — roles, duplicates, bootstrap count, IP capacity — are never
+  # bypassable, since a plan that violates them cannot succeed anyway.
+  validate_hostnames = try(tobool(local.config.validation.hostnames), true)
+
+  hosts_too_long   = [for n in local.config_host_names : n if length(n) > local.hostname_max_length]
+  hosts_all_digits = [for n in local.config_host_names : n if can(regex("^[0-9]+$", n))]
+  hosts_bad_chars = [
+    for n in local.config_host_names : n
+    if !can(regex("^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$", n))
+  ]
+  hosts_duplicated = [
+    for n in distinct(local.config_host_names) : n
+    if length([for m in local.config_host_names : m if m == n]) > 1
+  ]
+  hosts_bad_roles = [
+    for name, h in local.host_map : "${name} (role: ${try(h.role, "<missing>")})"
+    if !contains(local.allowed_roles, local.host_roles[name])
+  ]
+
+  netbios_name = trimspace(try(local.domain.netbios, ""))
+
   common_tags = merge(var.default_tags, try(local.aws_config.tags, {}), {
     environment = try(local.aws_config.environment, "dev")
   })
@@ -83,7 +160,7 @@ locals {
   service_user_password = var.service_password
 
   use_existing_instance_profile = try(local.aws_config.instance_profile_name, "") != ""
-  ssm_instance_profile_name = local.use_existing_instance_profile ? local.aws_config.instance_profile_name : aws_iam_instance_profile.ssm_instance_profile[0].name
+  ssm_instance_profile_name     = local.use_existing_instance_profile ? local.aws_config.instance_profile_name : aws_iam_instance_profile.ssm_instance_profile[0].name
 }
 
 provider "aws" {
@@ -115,31 +192,101 @@ data "aws_network_interface" "subnet_eni" {
   id       = each.key
 }
 
-check "has_hosts" {
-  assert {
-    condition     = length(local.hosts) > 0
-    error_message = "config.hosts must include at least one host."
-  }
-}
+# ---------------------------------------------------------------------------
+# Config validation
+#
+# Every rule here is a precondition rather than a `check` assertion: a failed
+# check is only a warning, so a 16-character hostname would still get applied
+# and fail hours later inside the rename phase. Preconditions abort the plan.
+# ---------------------------------------------------------------------------
 
-check "valid_host_roles" {
-  assert {
-    condition     = alltrue([for h in local.hosts : contains(local.allowed_roles, h.role)])
-    error_message = "All host roles must be one of: dhcp_server, agent_client, domain_controller."
+resource "terraform_data" "validation" {
+  # Feeding the validated values in as input keeps this resource in the plan
+  # whenever the host list changes, so the rules below can never go stale.
+  input = {
+    hosts     = local.config_host_names
+    roles     = local.host_roles
+    bootstrap = local.bootstrap_host
+    netbios   = local.netbios_name
+    pinned    = local.pinned_ip_by_host
   }
-}
 
-check "single_bootstrap" {
-  assert {
-    condition     = length(local.bootstrap_hosts) == 1
-    error_message = "Exactly one host must set bootstrap: true for forest creation."
-  }
-}
+  lifecycle {
+    precondition {
+      condition     = length(local.hosts) > 0
+      error_message = "config.hosts must include at least one host."
+    }
 
-check "ip_capacity" {
-  assert {
-    condition     = length(local.available_ips) >= length(local.unpinned_names)
-    error_message = "Not enough available IP addresses in selected subnet for hosts without an explicit ip."
+    precondition {
+      condition     = length(local.hosts_duplicated) == 0
+      error_message = "Duplicate host names in config.hosts: ${join(", ", local.hosts_duplicated)}. Host names must be unique."
+    }
+
+    precondition {
+      condition = !local.validate_hostnames || length(local.hosts_too_long) == 0
+      error_message = join("", [
+        "Host name(s) exceed the ${local.hostname_max_length}-character Windows computer name limit: ",
+        join(", ", [for n in local.hosts_too_long : "${n} (${length(n)} chars)"]),
+        ". Shorten the prefix and use the srvNN/cltNN forms — e.g. sw-srv01, sw-clt01 — instead of stgwin-dhcp01. ",
+        "Renaming an existing host replaces its instance, so to keep planning a legacy setup meanwhile set validation.hostnames: false in the config.",
+      ])
+    }
+
+    precondition {
+      condition = !local.validate_hostnames || length(local.hosts_bad_chars) == 0
+      error_message = join("", [
+        "Host name(s) contain characters that are invalid in a Windows computer name or DNS label: ",
+        join(", ", local.hosts_bad_chars),
+        ". Use letters, digits and inner hyphens only (no underscores, dots, or leading/trailing hyphen).",
+      ])
+    }
+
+    precondition {
+      condition     = !local.validate_hostnames || length(local.hosts_all_digits) == 0
+      error_message = "Host name(s) cannot be all digits: ${join(", ", local.hosts_all_digits)}."
+    }
+
+    precondition {
+      condition = length(local.hosts_bad_roles) == 0
+      error_message = join("", [
+        "Invalid host role(s): ", join(", ", local.hosts_bad_roles),
+        ". Valid roles are ", join(", ", local.allowed_roles),
+        " (legacy aliases dhcp_server/agent_client/domain_controller are also accepted).",
+      ])
+    }
+
+    precondition {
+      condition     = length(local.bootstrap_hosts) == 1
+      error_message = "Exactly one host must set bootstrap: true for forest creation, found ${length(local.bootstrap_hosts)}: ${join(", ", local.bootstrap_hosts)}."
+    }
+
+    precondition {
+      condition     = local.bootstrap_host == "" || local.host_roles[local.bootstrap_host] != "clt"
+      error_message = "The bootstrap host ${local.bootstrap_host} has role clt. It is promoted to a domain controller, so it must be dc (preferred) or srv."
+    }
+
+    precondition {
+      condition     = !local.validate_hostnames || (length(local.netbios_name) > 0 && length(local.netbios_name) <= local.netbios_max_length && can(regex("^[A-Za-z0-9-]+$", local.netbios_name)))
+      error_message = "domain.netbios must be 1-${local.netbios_max_length} characters of letters, digits or hyphens, got \"${local.netbios_name}\"."
+    }
+
+    precondition {
+      condition = length(local.pinned_ips_duplicated) == 0
+      error_message = join("", [
+        "Duplicate explicit ip: values in config.hosts: ",
+        join("; ", [
+          for ip in local.pinned_ips_duplicated :
+          "${ip} is pinned to ${join(", ", sort([for name, pinned in local.pinned_ip_by_host : name if pinned == ip]))}"
+        ]),
+        ". Each host needs its own address — drop the ip: line to have one auto-assigned, ",
+        "then run `make lock-ips` after the apply to pin it.",
+      ])
+    }
+
+    precondition {
+      condition     = length(local.available_ips) >= length(local.unpinned_names)
+      error_message = "Not enough available IP addresses in selected subnet for hosts without an explicit ip."
+    }
   }
 }
 
@@ -148,8 +295,8 @@ check "ip_capacity" {
 # ---------------------------------------------------------------------------
 
 locals {
-  ssm_log_bucket = try(local.config.ssm_logs.s3_bucket, "")
-  ssm_log_prefix = try(local.config.ssm_logs.s3_prefix, "ssm-logs")
+  ssm_log_bucket   = try(local.config.ssm_logs.s3_bucket, "")
+  ssm_log_prefix   = try(local.config.ssm_logs.s3_prefix, "ssm-logs")
   ssm_logs_enabled = local.ssm_log_bucket != ""
 }
 
@@ -227,9 +374,9 @@ resource "aws_instance" "nodes" {
   iam_instance_profile   = local.ssm_instance_profile_name
   key_name               = try(local.aws_config.key_name, null)
 
-  private_ip              = local.effective_ip_by_host[each.key]
+  private_ip                  = local.effective_ip_by_host[each.key]
   associate_public_ip_address = try(local.aws_config.associate_public_ip, false)
-  get_password_data       = true
+  get_password_data           = true
 
   root_block_device {
     volume_size = lookup(each.value, "disk_gb", 60)
@@ -247,7 +394,7 @@ resource "aws_instance" "nodes" {
 
   tags = merge(local.common_tags, {
     Name      = each.key
-    HostRole  = each.value.role
+    HostRole  = local.host_roles[each.key]
     Bootstrap = tostring(try(each.value.bootstrap, false))
   })
 }
@@ -261,10 +408,10 @@ resource "aws_ssm_document" "configure_networking" {
     schemaVersion = "2.2"
     description   = "Disable DHCP and set static networking"
     parameters = {
-      StaticIp = { type = "String" }
+      StaticIp     = { type = "String" }
       PrefixLength = { type = "String" }
-      Gateway  = { type = "String" }
-      DnsList  = { type = "String" }
+      Gateway      = { type = "String" }
+      DnsList      = { type = "String" }
     }
     mainSteps = [{
       action = "aws:runPowerShellScript"
@@ -286,7 +433,13 @@ resource "aws_ssm_document" "configure_networking" {
           "Set-DnsClientServerAddress -InterfaceIndex $ifIndex -ServerAddresses $dns",
           "if (-not (Get-NetRoute -DestinationPrefix '169.254.169.254/32' -ErrorAction SilentlyContinue)) { New-NetRoute -DestinationPrefix '169.254.169.254/32' -InterfaceIndex $ifIndex -NextHop '{{ Gateway }}' -RouteMetric 10 -ErrorAction SilentlyContinue }",
           "Set-NetConnectionProfile -InterfaceIndex $ifIndex -NetworkCategory Private -ErrorAction SilentlyContinue",
-          "Enable-NetFirewallRule -Name 'FPS-ICMP4-ERQ-In' -ErrorAction SilentlyContinue"
+          "# Enabling ICMP echo is a convenience, so this stays best-effort. It cannot",
+          "# rely on -ErrorAction to get there: right after the address change the",
+          "# NetSecurity module intermittently fails to autoload, and a module-load",
+          "# failure is not an ordinary cmdlet error — -ErrorAction does not suppress it,",
+          "# so under $ErrorActionPreference = 'Stop' it aborts the whole script and the",
+          "# host fails configure_networking having already been configured correctly.",
+          "foreach ($attempt in 1..3) { try { Import-Module NetSecurity -ErrorAction Stop; Enable-NetFirewallRule -Name 'FPS-ICMP4-ERQ-In' -ErrorAction Stop; Write-Host 'ICMP echo request rule enabled'; break } catch { Write-Host \"Attempt $attempt to enable the ICMP rule failed: $($_.Exception.Message)\"; if ($attempt -lt 3) { Start-Sleep -Seconds 5 } }}"
         ]
       }
     }]
@@ -321,6 +474,16 @@ resource "aws_ssm_association" "configure_networking" {
   # Rename (with reboot) runs first while DHCP is active; then we set static
   # networking so no subsequent reboot can reset DNS settings.
   wait_for_success_timeout_seconds = 600
+
+  # Replacing an instance would otherwise leave this association in place and
+  # merely update its targets. An update does not honour
+  # wait_for_success_timeout_seconds — it returns as soon as the API call lands —
+  # so the phase ordering collapses and State Manager re-fires every phase at once
+  # against a host that has not been renamed or rebooted yet. Forcing a replace
+  # puts each phase back through create, which does wait for success.
+  lifecycle {
+    replace_triggered_by = [aws_instance.nodes[each.key]]
+  }
 
   depends_on = [time_sleep.wait_for_rename_reboot]
 }
@@ -394,6 +557,16 @@ resource "aws_ssm_association" "rename_computer" {
 
   # Runs first on DHCP (SSM/DNS still work). Reboot happens here.
   wait_for_success_timeout_seconds = 300
+
+  # Replacing an instance would otherwise leave this association in place and
+  # merely update its targets. An update does not honour
+  # wait_for_success_timeout_seconds — it returns as soon as the API call lands —
+  # so the phase ordering collapses and State Manager re-fires every phase at once
+  # against a host that has not been renamed or rebooted yet. Forcing a replace
+  # puts each phase back through create, which does wait for success.
+  lifecycle {
+    replace_triggered_by = [aws_instance.nodes[each.key]]
+  }
 }
 
 resource "aws_ssm_document" "install_windows_features" {
@@ -418,9 +591,9 @@ resource "aws_ssm_document" "install_windows_features" {
           "while ($elapsed -lt $timeout) { $cbs = Get-Service -Name TrustedInstaller -ErrorAction SilentlyContinue; if ($cbs) { if ($cbs.Status -ne 'Running') { Start-Service TrustedInstaller -ErrorAction SilentlyContinue }; $cbs.Refresh(); if ($cbs.Status -eq 'Running') { break } }; Start-Sleep -Seconds 10; $elapsed += 10; Write-Host \"Waiting for TrustedInstaller... ($elapsed s)\" }",
           "if ($elapsed -ge $timeout) { throw 'TrustedInstaller did not start within timeout' }",
           "$role = '{{ HostRole }}'",
-          "if ($role -eq 'dhcp_server' -or $role -eq 'domain_controller') { $want = @('DHCP','DNS','RSAT-DHCP','RSAT-DNS-Server','RSAT-AD-Tools') }",
-          "if ($role -eq 'agent_client') { $want = @('RSAT-AD-PowerShell','RSAT-AD-Tools','RSAT-DNS-Server','RSAT-DHCP') }",
-          "if ($role -eq 'domain_controller') { $want += 'AD-Domain-Services' }",
+          "if ($role -eq 'srv' -or $role -eq 'dc') { $want = @('DHCP','DNS','RSAT-DHCP','RSAT-DNS-Server','RSAT-AD-Tools') }",
+          "if ($role -eq 'clt') { $want = @('RSAT-AD-PowerShell','RSAT-AD-Tools','RSAT-DNS-Server','RSAT-DHCP') }",
+          "if ($role -eq 'dc') { $want += 'AD-Domain-Services' }",
           "# Never force-reboot here: killing TrustedInstaller mid-transaction makes CBS",
           "# roll the install back, leaving features 'Available' while SSM reports success.",
           "Install-WindowsFeature -Name $want -IncludeManagementTools | Out-Null",
@@ -445,7 +618,7 @@ resource "aws_ssm_association" "install_windows_features" {
   }
 
   parameters = {
-    HostRole = local.host_map[each.key].role
+    HostRole = local.host_roles[each.key]
   }
 
   dynamic "output_location" {
@@ -457,6 +630,16 @@ resource "aws_ssm_association" "install_windows_features" {
   }
 
   wait_for_success_timeout_seconds = 1800
+
+  # Replacing an instance would otherwise leave this association in place and
+  # merely update its targets. An update does not honour
+  # wait_for_success_timeout_seconds — it returns as soon as the API call lands —
+  # so the phase ordering collapses and State Manager re-fires every phase at once
+  # against a host that has not been renamed or rebooted yet. Forcing a replace
+  # puts each phase back through create, which does wait for success.
+  lifecycle {
+    replace_triggered_by = [aws_instance.nodes[each.key]]
+  }
 
   depends_on = [aws_ssm_association.configure_networking]
 }
@@ -483,10 +666,10 @@ resource "aws_ssm_document" "bootstrap_domain" {
     schemaVersion = "2.2"
     description   = "Create forest/domain on bootstrap host"
     parameters = {
-      DomainFqdn     = { type = "String" }
-      DomainNetbios  = { type = "String" }
-      SafeModePass   = { type = "String" }
-      AdminPass      = { type = "String" }
+      DomainFqdn    = { type = "String" }
+      DomainNetbios = { type = "String" }
+      SafeModePass  = { type = "String" }
+      AdminPass     = { type = "String" }
     }
     mainSteps = [{
       action = "aws:runPowerShellScript"
@@ -532,6 +715,12 @@ resource "aws_ssm_association" "bootstrap_domain" {
 
   # Forest creation triggers a reboot; allow enough time for reboot + AD startup.
   wait_for_success_timeout_seconds = 1200
+
+  # No replace_triggered_by here, unlike the per-host associations:
+  # replace_triggered_by only accepts a whole resource, count.index or each.key,
+  # and aws_instance.nodes as a whole would re-run forest creation every time any
+  # unrelated host is replaced. Losing the bootstrap host destroys the domain and
+  # needs a full redeploy regardless, so there is nothing to order around here.
 
   depends_on = [time_sleep.wait_for_features_reboot]
 }
@@ -587,6 +776,12 @@ resource "aws_ssm_association" "configure_dns_forwarder" {
 
   wait_for_success_timeout_seconds = 120
 
+  # No replace_triggered_by here, unlike the per-host associations:
+  # replace_triggered_by only accepts a whole resource, count.index or each.key,
+  # and aws_instance.nodes as a whole would re-run forest creation every time any
+  # unrelated host is replaced. Losing the bootstrap host destroys the domain and
+  # needs a full redeploy regardless, so there is nothing to order around here.
+
   depends_on = [time_sleep.wait_for_bootstrap_reboot]
 }
 
@@ -596,6 +791,259 @@ resource "time_sleep" "wait_for_bootstrap_reboot" {
   create_duration = "180s"
 
   depends_on = [aws_ssm_association.bootstrap_domain]
+}
+
+# ---------------------------------------------------------------------------
+# Phase: Promote additional domain controllers
+#
+# The bootstrap host creates the forest; every other `dc` host is promoted into
+# the same domain here. Runs after join_domain, because promotion needs the host
+# to resolve the domain and reach the first DC, and before credential_setup,
+# because promotion turns the host's local groups into domain groups.
+# ---------------------------------------------------------------------------
+
+resource "aws_ssm_document" "promote_dc" {
+  name            = "${try(local.aws_config.name_prefix, "msad")}-promote-dc"
+  document_type   = "Command"
+  document_format = "JSON"
+
+  content = jsonencode({
+    schemaVersion = "2.2"
+    description   = "Promote an additional domain controller into the existing domain"
+    parameters = {
+      DomainFqdn   = { type = "String" }
+      AdminUser    = { type = "String" }
+      AdminPass    = { type = "String" }
+      SafeModePass = { type = "String" }
+    }
+    mainSteps = [{
+      action = "aws:runPowerShellScript"
+      name   = "PromoteDomainController"
+      inputs = {
+        runCommand = [
+          "$ErrorActionPreference = 'Stop'",
+          "",
+          "# Idempotency: DomainRole 4 (backup DC) or 5 (primary DC) means this host",
+          "# is already promoted. 3 is a member server, which is what we start from.",
+          "$domainRole = (Get-CimInstance Win32_ComputerSystem).DomainRole",
+          "if ($domainRole -ge 4) { Write-Host \"Already a domain controller (DomainRole=$domainRole), skipping\"; exit 0 }",
+          "",
+          "# Wait for an existing DC to be reachable. Promotion locates one through",
+          "# the same SRV record the domain join uses, so poll it the same way.",
+          "$srvName = '_ldap._tcp.dc._msdcs.{{ DomainFqdn }}'",
+          "$timeout = 600; $elapsed = 0; $found = $false",
+          "while ($elapsed -lt $timeout) {",
+          "    try {",
+          "        $srv = Resolve-DnsName $srvName -Type SRV -ErrorAction Stop",
+          "        Write-Host \"DC SRV record found: $($srv[0].NameTarget)\"",
+          "        $found = $true",
+          "        break",
+          "    } catch {",
+          "        Write-Host \"Waiting for DC SRV record ($srvName)... ($elapsed s)\"",
+          "        Start-Sleep 15",
+          "        $elapsed += 15",
+          "        try { Clear-DnsClientCache } catch {}",
+          "    }",
+          "}",
+          "if (-not $found) { throw \"DC SRV record $srvName not found after $${timeout}s\" }",
+          "",
+          "# AD DS binaries come from the install_features phase for dc hosts, but do",
+          "# not assume it: a config edited from srv to dc would not have them yet.",
+          "if ((Get-WindowsFeature -Name AD-Domain-Services).InstallState -ne 'Installed') { Install-WindowsFeature -Name AD-Domain-Services -IncludeManagementTools | Out-Null }",
+          "Import-Module ADDSDeployment",
+          "",
+          "$safe = ConvertTo-SecureString '{{ SafeModePass }}' -AsPlainText -Force",
+          "$sec = ConvertTo-SecureString '{{ AdminPass }}' -AsPlainText -Force",
+          "$cred = New-Object System.Management.Automation.PSCredential('{{ AdminUser }}', $sec)",
+          "",
+          "# -InstallDns makes this DC a DNS server; the AD-integrated zones arrive as",
+          "# part of replication. Promotion reboots on completion, exactly like the",
+          "# forest creation on the bootstrap host does.",
+          "Install-ADDSDomainController -DomainName '{{ DomainFqdn }}' -Credential $cred -SafeModeAdministratorPassword $safe -InstallDns -Force:$true -NoRebootOnCompletion:$false"
+        ]
+      }
+    }]
+  })
+}
+
+resource "aws_ssm_association" "promote_dc" {
+  for_each = {
+    for name, vm in aws_instance.nodes : name => vm if contains(local.promotable_dc_hosts, name)
+  }
+
+  name = aws_ssm_document.promote_dc.name
+
+  targets {
+    key    = "InstanceIds"
+    values = [each.value.id]
+  }
+
+  parameters = {
+    DomainFqdn   = local.domain.fqdn
+    AdminUser    = local.domain.admin_user
+    AdminPass    = local.domain_admin_password
+    SafeModePass = local.safe_mode_password
+  }
+
+  dynamic "output_location" {
+    for_each = local.ssm_logs_enabled ? [1] : []
+    content {
+      s3_bucket_name = local.ssm_log_bucket
+      s3_key_prefix  = "${local.ssm_log_prefix}/promote-dc/${each.key}"
+    }
+  }
+
+  # SRV wait (600s) + promotion + reboot + AD DS startup.
+  wait_for_success_timeout_seconds = 1800
+
+  # Replacing an instance would otherwise leave this association in place and
+  # merely update its targets. An update does not honour
+  # wait_for_success_timeout_seconds — it returns as soon as the API call lands —
+  # so the phase ordering collapses and State Manager re-fires every phase at once
+  # against a host that has not been renamed or rebooted yet. Forcing a replace
+  # puts each phase back through create, which does wait for success.
+  lifecycle {
+    replace_triggered_by = [aws_instance.nodes[each.key]]
+  }
+
+  # wait_for_features_reboot is named directly rather than relied on through the
+  # join/promotion chain. depends_on only orders operations *within one apply*: if
+  # the intervening resources are not changing they contribute no edge, and this
+  # phase is then free to run in parallel with an install_windows_features that is
+  # being replaced on its own. That is how de-dc02 came to run this phase while
+  # the DHCP role was still installing.
+  depends_on = [time_sleep.wait_for_features_reboot, time_sleep.wait_for_join_reboot]
+}
+
+resource "time_sleep" "wait_for_promotion" {
+  # Only exists when there is something to promote, so a single-DC setup does not
+  # pay this wait on every apply.
+  count = length(local.promotable_dc_hosts) > 0 ? 1 : 0
+
+  # A promoted DC needs longer than a plain reboot: AD DS has to start, SYSVOL has
+  # to finish its initial DFSR sync, and the local-to-domain group conversion has
+  # to settle before credential_setup touches group membership.
+  create_duration = "240s"
+
+  triggers = {
+    promotion_ids = join(",", sort([for k, v in aws_ssm_association.promote_dc : v.association_id]))
+  }
+
+  depends_on = [aws_ssm_association.promote_dc]
+}
+
+# ---------------------------------------------------------------------------
+# Phase: Re-assert DNS on a freshly promoted DC
+#
+# Promotion installs the DNS role on the new DC and can repoint its resolver at
+# itself. On its own that breaks name resolution for the AWS SSM endpoints, since
+# an AD DNS server in a private subnet has no route to the root hints — which is
+# exactly why the bootstrap DC gets a VPC forwarder. The forwarder association
+# cannot simply cover both: join_domain depends on it, so making it wait for
+# promotion would close a dependency cycle. Hence a second, later phase.
+# ---------------------------------------------------------------------------
+
+resource "aws_ssm_document" "configure_promoted_dc" {
+  name            = "${try(local.aws_config.name_prefix, "msad")}-promoted-dc-dns"
+  document_type   = "Command"
+  document_format = "JSON"
+
+  content = jsonencode({
+    schemaVersion = "2.2"
+    description   = "Re-assert resolver list and VPC forwarder on a promoted DC"
+    parameters = {
+      DnsList = { type = "String" }
+      VpcDns  = { type = "String" }
+    }
+    mainSteps = [{
+      action = "aws:runPowerShellScript"
+      name   = "ConfigurePromotedDcDns"
+      inputs = {
+        runCommand = [
+          "$ErrorActionPreference = 'Stop'",
+          "",
+          "# Put the resolver list back to the configured servers, with this DC first",
+          "# so it answers for the domain, and the VPC resolver retained as fallback.",
+          "$adapter = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' } | Select-Object -First 1",
+          "if ($adapter) {",
+          "    $servers = @('127.0.0.1') + ('{{ DnsList }}'.Split(',') | Where-Object { $_ -ne '127.0.0.1' })",
+          "    Set-DnsClientServerAddress -InterfaceIndex $adapter.IfIndex -ServerAddresses $servers",
+          "    Write-Host \"Resolver list set to: $($servers -join ', ')\"",
+          "}",
+          "",
+          "# Same VPC forwarder the bootstrap DC gets, so AWS endpoints resolve from",
+          "# this DC's own DNS service.",
+          "$existing = Get-DnsServerForwarder -ErrorAction SilentlyContinue | Select-Object -ExpandProperty IPAddress | ForEach-Object { $_.IPAddressToString }",
+          "if ('{{ VpcDns }}' -notin $existing) { Add-DnsServerForwarder -IPAddress '{{ VpcDns }}' -PassThru | Out-Null; Write-Host 'VPC DNS forwarder added' } else { Write-Host 'VPC DNS forwarder already present' }",
+          "",
+          "try { Clear-DnsClientCache } catch {}",
+          "",
+          "# Promotion changes this host's identity from member server to domain",
+          "# controller, so the machine account's cached Kerberos tickets are stale.",
+          "# SSM runs as SYSTEM and presents them, which AD rejects with",
+          "# \"the server has rejected the client credentials\" — dropping them forces a",
+          "# fresh ticket on the next call.",
+          "try { klist -li 0x3e7 purge | Out-Null } catch {}",
+          "",
+          "# AD DS, ADWS and the SPN registrations all come up on their own schedule",
+          "# after the promotion reboot, so this is retried rather than run once. The",
+          "# query is aimed at this DC by name: -Identity resolves through whichever DC",
+          "# the locator picks, which is the round trip that fails while credentials are",
+          "# still settling.",
+          "$dc = $null",
+          "foreach ($attempt in 1..10) { try { $dc = Get-ADDomainController -Server $env:COMPUTERNAME -ErrorAction Stop; break } catch { Write-Host \"Attempt $attempt/10: DC not answering yet ($($_.Exception.Message))\"; if ($attempt -lt 10) { Start-Sleep -Seconds 30 } } }",
+          "if (-not $dc) { throw \"Promotion verification failed: $env:COMPUTERNAME did not answer as a domain controller after 5 minutes\" }",
+          "Write-Host \"Promoted DC confirmed: $($dc.HostName), site $($dc.Site), GC=$($dc.IsGlobalCatalog)\""
+        ]
+      }
+    }]
+  })
+}
+
+resource "aws_ssm_association" "configure_promoted_dc" {
+  for_each = {
+    for name, vm in aws_instance.nodes : name => vm if contains(local.promotable_dc_hosts, name)
+  }
+
+  name = aws_ssm_document.configure_promoted_dc.name
+
+  targets {
+    key    = "InstanceIds"
+    values = [each.value.id]
+  }
+
+  parameters = {
+    DnsList = join(",", distinct(concat(local.dns_servers, [local.vpc_dns])))
+    VpcDns  = local.vpc_dns
+  }
+
+  dynamic "output_location" {
+    for_each = local.ssm_logs_enabled ? [1] : []
+    content {
+      s3_bucket_name = local.ssm_log_bucket
+      s3_key_prefix  = "${local.ssm_log_prefix}/promoted-dc-dns/${each.key}"
+    }
+  }
+
+  wait_for_success_timeout_seconds = 600
+
+  # Replacing an instance would otherwise leave this association in place and
+  # merely update its targets. An update does not honour
+  # wait_for_success_timeout_seconds — it returns as soon as the API call lands —
+  # so the phase ordering collapses and State Manager re-fires every phase at once
+  # against a host that has not been renamed or rebooted yet. Forcing a replace
+  # puts each phase back through create, which does wait for success.
+  lifecycle {
+    replace_triggered_by = [aws_instance.nodes[each.key]]
+  }
+
+  # wait_for_features_reboot is named directly rather than relied on through the
+  # join/promotion chain. depends_on only orders operations *within one apply*: if
+  # the intervening resources are not changing they contribute no edge, and this
+  # phase is then free to run in parallel with an install_windows_features that is
+  # being replaced on its own. That is how de-dc02 came to run this phase while
+  # the DHCP role was still installing.
+  depends_on = [time_sleep.wait_for_features_reboot, time_sleep.wait_for_promotion]
 }
 
 resource "aws_ssm_document" "join_domain" {
@@ -708,6 +1156,16 @@ resource "aws_ssm_association" "join_domain" {
   # DNS wait (600s) + LDAP wait (300s) + join retries (150s) + reboot
   wait_for_success_timeout_seconds = 1200
 
+  # Replacing an instance would otherwise leave this association in place and
+  # merely update its targets. An update does not honour
+  # wait_for_success_timeout_seconds — it returns as soon as the API call lands —
+  # so the phase ordering collapses and State Manager re-fires every phase at once
+  # against a host that has not been renamed or rebooted yet. Forcing a replace
+  # puts each phase back through create, which does wait for success.
+  lifecycle {
+    replace_triggered_by = [aws_instance.nodes[each.key]]
+  }
+
   depends_on = [aws_ssm_association.configure_dns_forwarder, time_sleep.wait_for_features_reboot]
 }
 
@@ -720,11 +1178,12 @@ resource "aws_ssm_document" "credential_setup" {
     schemaVersion = "2.2"
     description   = "Create service user and required remoting permissions"
     parameters = {
-      Username     = { type = "String" }
-      Password     = { type = "String" }
-      DomainFqdn   = { type = "String" }
-      TrustedHosts = { type = "String" }
-      IsBootstrap  = { type = "String", default = "false" }
+      Username           = { type = "String" }
+      Password           = { type = "String" }
+      DomainFqdn         = { type = "String" }
+      TrustedHosts       = { type = "String" }
+      IsDomainController = { type = "String", default = "false" }
+      DhcpServers        = { type = "String", default = "none" }
     }
     mainSteps = [{
       action = "aws:runPowerShellScript"
@@ -735,31 +1194,72 @@ resource "aws_ssm_document" "credential_setup" {
           "$username = '{{ Username }}'",
           "$upn = \"$username@{{ DomainFqdn }}\"",
           "$password = ConvertTo-SecureString '{{ Password }}' -AsPlainText -Force",
-          "$isBootstrap = '{{ IsBootstrap }}' -eq 'true'",
+          "$isDc = '{{ IsDomainController }}' -eq 'true'",
           "",
-          "# AD user creation — only on the DC (bootstrap host)",
-          "if ($isBootstrap) {",
-          "  # Complete DHCP post-install: create security groups and authorize in AD",
-          "  netsh dhcp add securitygroups 2>&1 | Write-Host",
-          "  Restart-Service dhcpserver -Force -ErrorAction SilentlyContinue",
-          "  $fqdn = \"$env:COMPUTERNAME.{{ DomainFqdn }}\"",
-          "  $ip = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.PrefixOrigin -ne 'WellKnown' } | Select-Object -First 1).IPAddress",
-          "  if (-not (Get-DhcpServerInDC | Where-Object { $_.DnsName -eq $fqdn })) { Add-DhcpServerInDC -DnsName $fqdn -IPAddress $ip; Write-Host \"DHCP server $fqdn authorized in AD\" } else { Write-Host \"DHCP server $fqdn already authorized\" }",
-          "  Write-Host 'DHCP security groups created (DHCP Administrators, DHCP Users)'",
+          "# --- DHCP post-install ------------------------------------------------",
+          "# Every host this phase targets carries the DHCP role, so this runs on all",
+          "# of them. Server Manager's post-deployment wizard does three things: create",
+          "# the security groups, authorize the server in AD, and write a completion",
+          "# flag. Doing only the first two leaves every host prompting for a manual",
+          "# click-through, which does not scale past a handful of servers.",
+          "netsh dhcp add securitygroups 2>&1 | Write-Host",
+          "Write-Host 'DHCP security groups created (DHCP Administrators, DHCP Users)'",
+          "",
+          "# Authorization is written to AD by the bootstrap host on behalf of the whole",
+          "# setup. SSM runs as SYSTEM, and a member server's machine account has no",
+          "# rights on the NetServices container, so a host that authorizes itself only",
+          "# succeeds when it is a DC. DhcpServers is 'none' on every other host.",
+          "$toAuthorize = @('{{ DhcpServers }}'.Split(',') | Where-Object { $_ -and $_ -ne 'none' })",
+          "foreach ($entry in $toAuthorize) {",
+          "  $parts = $entry.Split('=')",
+          "  $dhcpFqdn = \"$($parts[0]).{{ DomainFqdn }}\"",
+          "  if (-not (Get-DhcpServerInDC | Where-Object { $_.DnsName -eq $dhcpFqdn })) { Add-DhcpServerInDC -DnsName $dhcpFqdn -IPAddress $parts[1]; Write-Host \"Authorized $dhcpFqdn ($($parts[1])) in AD\" } else { Write-Host \"$dhcpFqdn already authorized\" }",
+          "}",
+          "# Verify rather than trust the call: authorization used to be wrapped in a",
+          "# catch that only warned, so a DHCP server that never got authorized still",
+          "# left this phase green while being unable to serve leases.",
+          "if ($toAuthorize) {",
+          "  $authorized = @((Get-DhcpServerInDC).DnsName)",
+          "  $missing = @($toAuthorize | ForEach-Object { \"$($_.Split('=')[0]).{{ DomainFqdn }}\" } | Where-Object { $authorized -notcontains $_ })",
+          "  if ($missing) { throw \"DHCP servers not authorized in AD: $($missing -join ', ')\" }",
+          "  Write-Host \"All $($toAuthorize.Count) DHCP servers authorized in AD\"",
+          "}",
+          "",
+          "# Clear the Server Manager post-deployment prompt (Roles\\12 is DHCP Server).",
+          "# Without this flag the wizard keeps asking on every host even though the work",
+          "# above has already been done, which is what forced a manual login per server.",
+          "$dhcpRoleKey = 'HKLM:\\SOFTWARE\\Microsoft\\ServerManager\\Roles\\12'",
+          "if (Test-Path $dhcpRoleKey) { Set-ItemProperty -Path $dhcpRoleKey -Name ConfigurationState -Value 2 -Force; Write-Host 'DHCP post-deployment configuration marked complete' } else { Write-Host \"Server Manager DHCP role key $dhcpRoleKey not found - skipping completion flag\" }",
+          "",
+          "# Restart DHCP last, so the service comes up having picked up both the",
+          "# security groups created above and its AD authorization. A non-bootstrap",
+          "# host is authorized by the bootstrap host's run of this same phase, which",
+          "# runs in parallel, so wait briefly for that to land first: a service that",
+          "# starts unauthorized refuses to serve leases until the next rogue-detection",
+          "# sweep, an hour later by default.",
+          "$myFqdn = \"$env:COMPUTERNAME.{{ DomainFqdn }}\"",
+          "if (-not $toAuthorize) {",
+          "  for ($attempt = 1; $attempt -le 18; $attempt++) {",
+          "    if (Get-DhcpServerInDC | Where-Object { $_.DnsName -eq $myFqdn }) { Write-Host \"$myFqdn is authorized in AD\"; break }",
+          "    # A warning, not a throw: the bootstrap host's own run fails outright if",
+          "    # authorization is genuinely broken, so failing here too would only turn",
+          "    # one clear failure into a fleet-wide cascade.",
+          "    if ($attempt -eq 18) { Write-Host \"Warning: $myFqdn still not authorized after 3 minutes - restarting anyway, check the bootstrap host's credential_setup run\" } else { Write-Host \"Waiting for the bootstrap host to authorize $myFqdn ($attempt/18)...\"; Start-Sleep -Seconds 10 }",
+          "  }",
+          "}",
+          "Restart-Service dhcpserver -Force",
+          "$dhcpSvc = Get-Service dhcpserver",
+          "if ($dhcpSvc.Status -ne 'Running') { throw \"DHCP Server service is $($dhcpSvc.Status) after restart on $(hostname)\" }",
+          "Write-Host \"DHCP Server service restarted and running on $(hostname)\"",
+          "",
+          "# AD user creation — only on a domain controller. Runs on every DC: the",
+          "# guards below make it a no-op once the first one has created the user.",
+          "if ($isDc) {",
           "  if (-not (Get-ADUser -Filter \"UserPrincipalName -eq '$upn'\" -ErrorAction SilentlyContinue)) { New-ADUser -Name $username -SamAccountName $username -UserPrincipalName $upn -AccountPassword $password -Enabled $true; Write-Host \"Created user $upn\" } else { Write-Host \"User $upn already exists\" }",
           "  foreach ($grp in @('Domain Users','Remote Management Users','DNSAdmins','DHCP Administrators')) { try { Add-ADGroupMember -Identity $grp -Members $username -ErrorAction Stop; Write-Host \"Added to $grp\" } catch { if ($_.Exception.Message -match 'already a member') { Write-Host \"Already in $grp\" } elseif ($_.Exception.Message -match 'Cannot find an object with identity') { Write-Host \"Group $grp not found, skipping\" } else { throw } } }",
           "} else {",
-          "  Write-Host \"Non-DC host — creating DHCP security groups and authorizing in AD\"",
-          "  netsh dhcp add securitygroups 2>&1 | Write-Host",
-          "  Restart-Service dhcpserver -Force -ErrorAction SilentlyContinue",
-          "  Write-Host 'DHCP security groups created (DHCP Administrators, DHCP Users)'",
-          "  # Authorize this DHCP server in AD (requires domain cred)",
-          "  $secPass = ConvertTo-SecureString '{{ Password }}' -AsPlainText -Force",
-          "  $domCred = New-Object System.Management.Automation.PSCredential('{{ Username }}@{{ DomainFqdn }}', $secPass)",
-          "  $fqdn = \"$env:COMPUTERNAME.{{ DomainFqdn }}\"",
-          "  $ip = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.PrefixOrigin -ne 'WellKnown' } | Select-Object -First 1).IPAddress",
-          "  try { if (-not (Get-DhcpServerInDC | Where-Object { $_.DnsName -eq $fqdn })) { Add-DhcpServerInDC -DnsName $fqdn -IPAddress $ip; Write-Host \"DHCP server $fqdn authorized in AD\" } else { Write-Host \"DHCP server $fqdn already authorized\" } } catch { Write-Host \"Warning: Could not authorize DHCP server in AD: $($_.Exception.Message)\" }",
-          "  # Add service user to local DHCP Administrators group",
+          "  # Add service user to the local DHCP Administrators group. On a DC this is",
+          "  # an AD group and is handled by the branch above.",
           "  $domainPrefix = '{{ DomainFqdn }}'.Split('.')[0].ToUpper()",
           "  $localAccount = \"$domainPrefix\\{{ Username }}\"",
           "  # A missing group means the DHCP role never installed - fail fast rather than",
@@ -771,9 +1271,9 @@ resource "aws_ssm_document" "credential_setup" {
           "# Add service user to local Remote Management Users group (non-DC hosts only; on DCs this is an AD group already handled above)",
           "$domainPrefix = '{{ DomainFqdn }}'.Split('.')[0].ToUpper()",
           "$localAccount = \"$domainPrefix\\$username\"",
-          "if (-not $isBootstrap) { for ($attempt = 1; $attempt -le 12; $attempt++) { try { Add-LocalGroupMember -Group 'Remote Management Users' -Member $localAccount -ErrorAction Stop; Write-Host \"Added $localAccount to local Remote Management Users on $(hostname)\"; break } catch { if ($_.Exception.Message -match 'already a member') { Write-Host \"$localAccount already in local Remote Management Users\"; break } elseif ($_.Exception.Message -match 'not found|PrincipalNotFound' -and $attempt -lt 12) { Write-Host \"Retry $attempt/12: $localAccount not resolvable yet, waiting 15s...\"; Start-Sleep -Seconds 15 } else { throw } } } } else { Write-Host 'DC host — Remote Management Users is an AD group, already configured' }",
+          "if (-not $isDc) { for ($attempt = 1; $attempt -le 12; $attempt++) { try { Add-LocalGroupMember -Group 'Remote Management Users' -Member $localAccount -ErrorAction Stop; Write-Host \"Added $localAccount to local Remote Management Users on $(hostname)\"; break } catch { if ($_.Exception.Message -match 'already a member') { Write-Host \"$localAccount already in local Remote Management Users\"; break } elseif ($_.Exception.Message -match 'not found|PrincipalNotFound' -and $attempt -lt 12) { Write-Host \"Retry $attempt/12: $localAccount not resolvable yet, waiting 15s...\"; Start-Sleep -Seconds 15 } else { throw } } } } else { Write-Host 'DC host — Remote Management Users is an AD group, already configured' }",
           "",
-          "# CredSSP, firewall, TrustedHosts — all DHCP servers",
+          "# CredSSP, firewall, TrustedHosts — all server hosts",
           "Enable-WSManCredSSP -Role Server -Force",
           "Set-NetFirewallRule -Name 'WINRM-HTTP-In-TCP-PUBLIC' -RemoteAddress Any",
           "Set-Item WSMan:\\localhost\\Client\\TrustedHosts -Value '{{ TrustedHosts }}' -Force",
@@ -790,6 +1290,17 @@ resource "aws_ssm_document" "credential_setup" {
           "  $ace.AceType = 0",
           "  $ace.AceFlags = 0",
           "  $ace.Trustee = $trustee",
+          "  # Drop any entries this SID already has before adding one. Appending",
+          "  # unconditionally added a duplicate ACE on every run, and this phase re-runs",
+          "  # on every host whenever the host list changes, so the DACL grew without",
+          "  # bound. Rebuilding also clears duplicates already present and corrects the",
+          "  # mask if it ever changes.",
+          "  # Filter with foreach, not Where-Object: the pipeline wraps each WMI",
+          "  # ManagementBaseObject in a PSObject, and assigning that array back to",
+          "  # $sd.DACL fails with \"Unable to cast object of type PSObject\".",
+          "  $keep = @(); $stale = 0",
+          "  foreach ($existingAce in $sd.DACL) { if ($existingAce.Trustee.SIDString -eq $sid.Value) { $stale++ } else { $keep += $existingAce } }",
+          "  if ($stale -gt 0) { Write-Host \"[WMI] Replacing $stale existing ACE(s) for $account\"; $sd.DACL = $keep }",
           "  $sd.DACL += $ace",
           "  $sec.SetSecurityDescriptor($sd) | Out-Null",
           "  $newSd = $sec.GetSecurityDescriptor().Descriptor",
@@ -799,7 +1310,7 @@ resource "aws_ssm_document" "credential_setup" {
           "Write-Host \"[WMI] domainPrefix=$domainPrefix username=$username hostname=$(hostname)\"",
           "foreach ($ns in @('Root/Microsoft/Windows/DNS')) { Set-WmiNamespaceSecurity $ns \"$domainPrefix\\$username\"; Set-WmiNamespaceSecurity $ns \"$domainPrefix\\DNSAdmins\"; Write-Host \"WMI: $username + DNSAdmins granted on $ns\" }",
           "try { foreach ($acct in @(\"$domainPrefix\\$username\", \"$domainPrefix\\DNSAdmins\")) { Set-WmiNamespaceSecurity 'Root/Microsoft/Windows/DHCP' $acct }; Write-Host \"WMI: $username + DNSAdmins granted on Root/Microsoft/Windows/DHCP\" } catch { Write-Host \"DHCP WMI namespace not available, skipping: $($_.Exception.Message)\" }",
-          "if ($isBootstrap) {",
+          "if ($isDc) {",
           "  $u = Get-ADUser -Identity $username -Properties MemberOf,UserPrincipalName,Enabled,WhenCreated",
           "  Write-Host '--- User Details ---'",
           "  Write-Host \"  SAM Account : $($u.SamAccountName)\"",
@@ -818,7 +1329,7 @@ resource "aws_ssm_document" "credential_setup" {
 
 resource "aws_ssm_association" "credential_setup" {
   for_each = {
-    for name, vm in aws_instance.nodes : name => vm if local.host_map[name].role == "dhcp_server" || name == local.bootstrap_host
+    for name, vm in aws_instance.nodes : name => vm if contains(local.server_hosts, name) || name == local.bootstrap_host
   }
 
   name = aws_ssm_document.credential_setup.name
@@ -832,8 +1343,21 @@ resource "aws_ssm_association" "credential_setup" {
     Username     = local.credentials.service_user
     Password     = local.service_user_password
     DomainFqdn   = local.domain.fqdn
-    TrustedHosts = join(",", [for name in local.dhcp_hosts : local.effective_ip_by_host[name]])
-    IsBootstrap  = each.key == local.bootstrap_host ? "true" : "false"
+    TrustedHosts = join(",", [for name in local.server_hosts : local.effective_ip_by_host[name]])
+    # Selects the AD-group path over the local-group path. Promoting a host to a
+    # DC converts its local groups into domain groups, so any additional DC has
+    # to take the same branch as the bootstrap host once promotion is wired up.
+    IsDomainController = contains(local.domain_controllers, each.key) ? "true" : "false"
+    # Every DHCP server in the setup, authorized in AD by the bootstrap host alone.
+    # SSM runs as SYSTEM, so a member server cannot authorize itself: its machine
+    # account has no rights on the NetServices container. Doing it from one host
+    # also keeps the completeness check race-free, since the same run writes and
+    # verifies the whole list. "none" is a sentinel rather than an empty string,
+    # which SSM rejects as a parameter value.
+    DhcpServers = each.key == local.bootstrap_host ? join(",", [
+      for name in distinct(concat(local.server_hosts, [local.bootstrap_host])) :
+      "${name}=${local.effective_ip_by_host[name]}"
+    ]) : "none"
   }
 
   dynamic "output_location" {
@@ -844,9 +1368,28 @@ resource "aws_ssm_association" "credential_setup" {
     }
   }
 
-  wait_for_success_timeout_seconds = 600
+  # 900 rather than the 600 used by the other phases: a non-bootstrap host may
+  # wait up to 3 minutes for the bootstrap host to authorize it in AD before it
+  # restarts the DHCP service, on top of this phase's existing retry loops.
+  wait_for_success_timeout_seconds = 900
 
-  depends_on = [time_sleep.wait_for_join_reboot]
+  # Replacing an instance would otherwise leave this association in place and
+  # merely update its targets. An update does not honour
+  # wait_for_success_timeout_seconds — it returns as soon as the API call lands —
+  # so the phase ordering collapses and State Manager re-fires every phase at once
+  # against a host that has not been renamed or rebooted yet. Forcing a replace
+  # puts each phase back through create, which does wait for success.
+  lifecycle {
+    replace_triggered_by = [aws_instance.nodes[each.key]]
+  }
+
+  # wait_for_features_reboot is named directly rather than relied on through the
+  # join/promotion chain. depends_on only orders operations *within one apply*: if
+  # the intervening resources are not changing they contribute no edge, and this
+  # phase is then free to run in parallel with an install_windows_features that is
+  # being replaced on its own. That is how de-dc02 came to run this phase while
+  # the DHCP role was still installing.
+  depends_on = [time_sleep.wait_for_features_reboot, time_sleep.wait_for_join_reboot, time_sleep.wait_for_promotion, aws_ssm_association.configure_promoted_dc]
 }
 
 resource "time_sleep" "wait_for_join_reboot" {
@@ -866,7 +1409,7 @@ resource "aws_ssm_document" "agent_setup" {
 
   content = jsonencode({
     schemaVersion = "2.2"
-    description   = "Configure agent client: CredSSP, GPO delegation, RSAT, targets"
+    description   = "Configure agent client: CredSSP, GPO delegation, RSAT, target servers"
     parameters = {
       TargetServers = { type = "String" }
       DcIps         = { type = "String" }
@@ -881,7 +1424,7 @@ resource "aws_ssm_document" "agent_setup" {
         runCommand = [
           "$ErrorActionPreference = 'Stop'",
           "",
-          "# --- CredSSP Client (DC + DHCP targets) ---",
+          "# --- CredSSP Client (DC + managed server targets) ---",
           "$dcIps = '{{ DcIps }}'.Split(',')",
           "$targetIps = '{{ TargetServers }}'.Split(',')",
           "$allIps = ($dcIps + $targetIps) | Select-Object -Unique",
@@ -926,8 +1469,8 @@ resource "aws_ssm_document" "agent_setup" {
           "$path = 'C:\\ProgramData\\msad-agent'",
           "New-Item -Path $path -ItemType Directory -Force | Out-Null",
           "$targets = '{{ TargetServers }}'.Split(',')",
-          "$targets | ConvertTo-Json | Set-Content -Path \"$path\\dhcp-targets.json\"",
-          "Write-Host \"Agent targets written to $path\\dhcp-targets.json\"",
+          "$targets | ConvertTo-Json | Set-Content -Path \"$path\\server-targets.json\"",
+          "Write-Host \"Agent targets written to $path\\server-targets.json\"",
           "",
           "# --- Verify CredSSP with Invoke-Command ---",
           "$secPass = ConvertTo-SecureString '{{ Password }}' -AsPlainText -Force",
@@ -946,7 +1489,7 @@ resource "aws_ssm_document" "agent_setup" {
 
 resource "aws_ssm_association" "agent_setup" {
   for_each = {
-    for name, vm in aws_instance.nodes : name => vm if local.host_map[name].role == "agent_client"
+    for name, vm in aws_instance.nodes : name => vm if local.host_roles[name] == "clt"
   }
 
   name = aws_ssm_document.agent_setup.name
@@ -957,7 +1500,7 @@ resource "aws_ssm_association" "agent_setup" {
   }
 
   parameters = {
-    TargetServers = join(",", [for name in local.dhcp_hosts : local.effective_ip_by_host[name]])
+    TargetServers = join(",", [for name in local.server_hosts : local.effective_ip_by_host[name]])
     DcIps         = local.effective_ip_by_host[local.bootstrap_host]
     Username      = local.credentials.service_user
     Password      = local.service_user_password
@@ -974,5 +1517,21 @@ resource "aws_ssm_association" "agent_setup" {
 
   wait_for_success_timeout_seconds = 300
 
-  depends_on = [aws_ssm_association.credential_setup]
+  # Replacing an instance would otherwise leave this association in place and
+  # merely update its targets. An update does not honour
+  # wait_for_success_timeout_seconds — it returns as soon as the API call lands —
+  # so the phase ordering collapses and State Manager re-fires every phase at once
+  # against a host that has not been renamed or rebooted yet. Forcing a replace
+  # puts each phase back through create, which does wait for success.
+  lifecycle {
+    replace_triggered_by = [aws_instance.nodes[each.key]]
+  }
+
+  # wait_for_features_reboot is named directly rather than relied on through the
+  # join/promotion chain. depends_on only orders operations *within one apply*: if
+  # the intervening resources are not changing they contribute no edge, and this
+  # phase is then free to run in parallel with an install_windows_features that is
+  # being replaced on its own. That is how de-dc02 came to run this phase while
+  # the DHCP role was still installing.
+  depends_on = [time_sleep.wait_for_features_reboot, aws_ssm_association.credential_setup]
 }

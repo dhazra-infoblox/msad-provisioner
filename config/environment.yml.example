@@ -36,7 +36,7 @@ aws:
   root_volume_encrypted: true
   # Optional KMS key for root disk encryption.
   # root_volume_kms_key_id: arn:aws:kms:us-east-1:123456789012:key/your-key-id
-  name_prefix: msad_dhcp
+  name_prefix: msad
   environment: dev
   tags:
     owner: your-team
@@ -58,22 +58,41 @@ network:
 credentials:
   service_user: infoblox_agent
 
+# Optional. Host name rules are enforced at plan time. Set hostnames to false
+# only for a setup that was deployed before the 15-character limit was checked —
+# correcting a name replaces the instance, so it should be a deliberate step.
+# validation:
+#   hostnames: true
+
 # Optional. Omit or remove s3_bucket to disable SSM output logging.
 # ssm_logs:
 #   s3_bucket: your-bucket-name
 #   s3_prefix: ssm-logs
 
+# Host roles (a role names what the host is, not one service it runs):
+#   dc  - domain controller: AD DS + DNS + DHCP. The bootstrap host becomes one.
+#   srv - member server:     DNS + DHCP + AD tools, domain-joined, not promoted.
+#   clt - agent client:      RSAT tools + CredSSP client, joined as a member server.
+# The legacy names domain_controller / dhcp_server / agent_client still work.
+#
+# Exactly one host must set bootstrap: true — that host creates the forest and is
+# the first DC. Any other dc host is promoted into the same domain by the
+# promote_dc phase, giving you a second writable DC and DNS server.
+#
+# Host names must be at most 15 characters (Windows computer name limit) using
+# letters, digits and inner hyphens. Keep the <prefix>-dcNN / <prefix>-srvNN /
+# <prefix>-cltNN form so a prefixed name still fits: sw-dc01, sw-srv01, sw-clt01.
 hosts:
-  - name: dhcp01
-    role: dhcp_server
+  - name: dc01
+    role: dc
     bootstrap: true
     instance_type: t3.large
     disk_gb: 100
-  - name: dhcp02
-    role: dhcp_server
+  - name: srv01
+    role: srv
     instance_type: t3.large
     disk_gb: 100
-  - name: client01
-    role: agent_client
+  - name: clt01
+    role: clt
     instance_type: t3.medium
     disk_gb: 80

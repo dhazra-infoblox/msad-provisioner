@@ -15,16 +15,35 @@ import sys
 
 
 def get_ip_map(tf_dir):
+    """Map host name -> private IP, read from the state file.
+
+    Deliberately not the host_inventory output: Terraform only recomputes
+    outputs at the end of a *successful* apply, so after a partial failure the
+    output still describes the previous run. Pinning from it would silently skip
+    the hosts that were just created, leaving them to keep drawing from the
+    auto-assign pool — which is the exact shuffling this script exists to stop.
+    The state is written as each resource completes, so it sees every instance.
+    """
     result = subprocess.run(
-        ["terraform", f"-chdir={tf_dir}", "output", "-json", "host_inventory"],
+        ["terraform", f"-chdir={tf_dir}", "show", "-json"],
         capture_output=True,
         text=True,
     )
     if result.returncode != 0:
-        print(f"terraform output failed:\n{result.stderr}", file=sys.stderr)
+        print(f"terraform show failed:\n{result.stderr}", file=sys.stderr)
         sys.exit(1)
-    inventory = json.loads(result.stdout)
-    return {name: info["private_ip"] for name, info in inventory.items()}
+
+    doc = json.loads(result.stdout)
+    resources = doc.get("values", {}).get("root_module", {}).get("resources", [])
+
+    ip_map = {}
+    for res in resources:
+        if res.get("type") != "aws_instance" or res.get("name") != "nodes":
+            continue
+        name, private_ip = res.get("index"), res.get("values", {}).get("private_ip")
+        if name and private_ip:
+            ip_map[str(name)] = private_ip
+    return ip_map
 
 
 def patch_yaml(config_file, ip_map):

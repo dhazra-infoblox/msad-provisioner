@@ -3,10 +3,10 @@
 ## Scope (Current Phase)
 Build a simple multi-server baseline on AWS using Terraform + SSM:
 - 3 Windows Server 2025 VMs
-- 2 DHCP servers: `dhcp01`, `dhcp02`
-- 1 agent/client server: `agent01`
+- 2 member servers (role `srv`): `srv01`, `srv02` — each running AD tools, DNS and DHCP
+- 1 agent client (role `clt`): `clt01`
 - All hosts in the same AD forest/domain
-- Full credential and remoting setup for DHCP object collection from both DHCP servers
+- Full credential and remoting setup for object collection from both server hosts
 
 Nestle large-scale sizing/distribution requirements are deferred and kept as backlog context.
 
@@ -17,9 +17,12 @@ Nestle large-scale sizing/distribution requirements are deferred and kept as bac
 - Operator workflow: Makefile targets (`init`, `plan`, `apply`, `status`, `progress`, etc.)
 
 ## Role Model
-- `domain_controller`: must be promoted to DC
-- `dhcp_server`: domain-joined DHCP role host, no DC promotion
-- `agent_client`: domain-joined management/collector host, no DC promotion
+- `dc`: must be promoted to DC
+- `srv`: domain-joined member server (DNS + DHCP + AD tools), no DC promotion
+- `clt`: domain-joined management/collector host, no DC promotion
+
+The longer names used earlier — `domain_controller`, `dhcp_server`, `agent_client` — are still
+accepted as aliases.
 
 ## Workflow
 1. Parse YAML config and validate role/host/domain rules.
@@ -39,7 +42,7 @@ Nestle large-scale sizing/distribution requirements are deferred and kept as bac
    - CredSSP server/client
    - TrustedHosts
    - WinRM/firewall rules
-10. Configure `agent01` target list for `dhcp01` and `dhcp02`.
+10. Configure the `clt01` target list for `srv01` and `srv02`.
 11. Expose status/progress through SSM association outputs.
 
 ## Deliverables in Repo
@@ -53,15 +56,16 @@ Nestle large-scale sizing/distribution requirements are deferred and kept as bac
 ## Verification Checklist
 1. 3 hosts provisioned with expected roles and static private IPs.
 2. One forest/domain created; all 3 hosts domain-joined.
-3. DHCP role installed on `dhcp01` and `dhcp02`.
-4. RSAT/tools installed on `agent01`.
+3. DNS and DHCP roles installed on `srv01` and `srv02`.
+4. RSAT/tools installed on `clt01`.
 5. Service user created with required group memberships.
-6. Remoting prerequisites validated from agent to DHCP hosts.
-7. Agent can access DHCP object paths (subnets, reservations, leases).
+6. Remoting prerequisites validated from agent to server hosts.
+7. Agent can access DNS and DHCP object paths (zones, subnets, reservations, leases).
 8. Progress/status commands show per-phase state and completion.
 9. Re-run is idempotent.
 
 ## Backlog (Deferred)
+- Promotion of additional `dc` hosts (`Install-ADDSDomainController`) for multi-DC domains
 - Nestle-scale regional distribution and 10-vs-20 servers/agent planning mode
 - Advanced DNS zone/record automation
 - DHCP scope/options/reservations policy automation
