@@ -39,8 +39,11 @@ output "phase_association_ids" {
     join_domain              = { for k, v in aws_ssm_association.join_domain : k => v.association_id }
     promote_dc               = { for k, v in aws_ssm_association.promote_dc : k => v.association_id }
     configure_promoted_dc    = { for k, v in aws_ssm_association.configure_promoted_dc : k => v.association_id }
-    credential_setup         = { for k, v in aws_ssm_association.credential_setup : k => v.association_id }
-    agent_setup              = { for k, v in aws_ssm_association.agent_setup : k => v.association_id }
+    credential_setup = merge(
+      { for k, v in aws_ssm_association.credential_setup_bootstrap : k => v.association_id },
+      { for k, v in aws_ssm_association.credential_setup_members : k => v.association_id },
+    )
+    agent_setup = { for k, v in aws_ssm_association.agent_setup : k => v.association_id }
   }
 }
 

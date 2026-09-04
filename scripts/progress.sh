@@ -71,6 +71,12 @@ PHASE_ORDER = [
     "promote_dc", "configure_promoted_dc", "credential_setup", "agent_setup",
 ]
 
+# Association resources whose name differs from the phase they belong to.
+RESOURCE_PHASE = {
+    "credential_setup_bootstrap": "credential_setup",
+    "credential_setup_members": "credential_setup",
+}
+
 # --- hosts from the config -------------------------------------------------
 # Parsed by hand rather than with PyYAML, which is not a dependency of this
 # repo; the hosts block is a flat list of scalars, same as lock_ips.py assumes.
@@ -148,7 +154,11 @@ for res in doc.get("values", {}).get("root_module", {}).get("resources", []):
     assoc_id = vals.get("association_id") or vals.get("id") or ""
     index = res.get("index")
     host = "global" if index is None else str(index)
-    found.setdefault(res["name"], {})[host] = assoc_id
+    # credential_setup runs as two resources — the bootstrap host authorizes
+    # every DHCP server in AD, the member servers wait on it — but it is one
+    # phase to anyone reading this table, so both fold into one set of rows.
+    phase = RESOURCE_PHASE.get(res["name"], res["name"])
+    found.setdefault(phase, {})[host] = assoc_id
 
 for phase in PHASE_ORDER:
     in_state = found.get(phase, {})

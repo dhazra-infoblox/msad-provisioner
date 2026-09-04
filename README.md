@@ -82,7 +82,7 @@ When multiple setups share the same subnet, two fields in each config must be un
 | `aws.name_prefix` | Drives SSM document names in AWS (must be globally unique per account) | `msad_lab1`, `msad_lab2` |
 | `network.ip_start_offset` | Which IP index to start assigning from; prevents IP conflicts | `10`, `30`, `50`, `70` … |
 
-Allow at least 20 IP slots per setup (2 server hosts + 1 agent client + buffer). The `create-setup` script auto-picks a safe offset by scanning all existing configs.
+Allow at least 20 IP slots per setup (2 server hosts + 1 agent client + buffer). The `create-setup` script auto-picks a safe offset by scanning the existing configs that share the same subnet.
 
 `ip_start_offset` only governs where auto-assignment *begins*; it does not reserve a range. Growing a setup past its slice will run into the next setup's offset, and the IP capacity precondition fails the plan if the subnet runs out of room past the offset. Pin IPs with [`make lock-ips`](#ip-pinning) so allocations stay put.
 
@@ -189,9 +189,14 @@ Do not use `config/environment.yml` as the place to update those. It is the
 or subnet forces every instance in that setup to be replaced on the next apply.
 Pass `SOURCE_CONFIG=<path>` to scaffold from a specific config instead.
 
-`ip_start_offset` is derived from every existing setup's actual footprint
-(`ip_start_offset` + host count) plus a gap of 10, so a large setup does not
-overlap the next one's range. Pass `IP_OFFSET=` to choose it yourself.
+`ip_start_offset` is derived from the footprint (`ip_start_offset` + host
+count) of every existing setup **in the same subnet**, plus a gap of 10, so a
+large setup does not overlap the next one's range. The new setup goes in the
+first gap wide enough to hold it rather than after the highest range in use —
+setups get deleted, so the space below the watermark is mostly free, and
+appending to the end eventually walks off a /24. If nothing fits, `create-setup`
+fails instead of scaffolding a config that cannot be planned. Pass `IP_OFFSET=`
+to choose the offset yourself.
 
 Budget the apply time: every SSM phase fans out per host, and `make apply` runs at
 `-parallelism=5` (see Make Targets), so a 23-host setup works through each phase in
@@ -404,7 +409,7 @@ The in-place updates re-run those scripts on existing machines. They are idempot
 | Check | Limit | Symptom if violated |
 |-------|-------|---------------------|
 | Hostname length | **≤ 15 characters** | Plan fails validation. `lab1-client01` is 16; `lab1-clt01` is 10 and works. |
-| Free IPs past `ip_start_offset` | Enough for the new hosts | Plan fails the IP capacity precondition |
+| Free IPs past `ip_start_offset` | Enough for the new hosts, within the subnet | Plan fails the IP capacity or offset-range precondition |
 | EC2 vCPU quota | Account-wide | Instances launch then vanish: `collecting instance settings: empty result` |
 
 The 15-character cap is the easiest one to trip, since a long suffix like `client01` pushes a prefixed name over on its own — that is exactly why the suffixes are `srvNN` and `cltNN`. The first two rows are now caught at plan time rather than mid-apply.

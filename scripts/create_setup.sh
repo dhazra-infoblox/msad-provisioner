@@ -25,6 +25,16 @@ CLIENTS="${CLIENTS:-}"
 # this at plan time too; catching it here means a bad setup is never scaffolded.
 HOSTNAME_MAX_LENGTH=15
 
+# Auto-assignment starts at .10 — the low addresses are the AWS-reserved ones
+# plus a little headroom — and the last index Terraform will hand out of a /24
+# is .253. Larger subnets have more room, but the offset is only ever derived
+# here; Terraform validates it against the real subnet mask at plan time, so
+# assuming the smallest subnet in use keeps this from generating an offset that
+# cannot be planned.
+IP_OFFSET_MIN=10
+IP_OFFSET_MAX=253
+IP_OFFSET_GAP=10
+
 fail() {
   echo "ERROR: $*" >&2
   exit 1
@@ -40,17 +50,37 @@ host_count() {
   ' "$1"
 }
 
-# Pick a starting offset that clears every existing setup's address range.
+# Read aws.subnet_id out of a config file.
+config_subnet_id() {
+  awk '
+    /^aws:/ { in_aws=1; next }
+    in_aws && /^[^[:space:]]/ { in_aws=0 }
+    in_aws && $1 == "subnet_id:" { print $2; exit }
+  ' "$1"
+}
+
+# Pick a starting offset for a setup of $2 hosts landing in subnet $1.
 #
-# This reserves against each setup's actual footprint (offset + host count)
-# rather than assuming a fixed stride. The old flat "+20" silently overlapped
-# the next setup as soon as one grew past 20 hosts, which is exactly what
-# SERVERS=20 produces.
+# Only setups sharing that subnet can collide, so configs pointing elsewhere are
+# skipped — counting them made the address space look far more crowded than it
+# was and pushed new setups off the end of it.
+#
+# Placement fills the first gap wide enough for the new setup rather than always
+# appending past the highest range in use. Appending is what produced offsets
+# beyond the subnet once the setups above added up to more than a /24: setups
+# are deleted as often as they are created, so the space below the watermark is
+# mostly free.
 next_ip_offset() {
-  local f offset count end highest=0
+  local subnet="$1" need="$2"
+  local f offset count cursor start end
+
+  # Each setup reserves [offset, offset + host count), and setups are kept
+  # IP_OFFSET_GAP apart so either side can grow a little without a re-plan.
+  local blocks=()
 
   for f in "$ROOT_DIR"/config/*.yml; do
     [ -e "$f" ] || continue
+    [ "$(config_subnet_id "$f")" = "$subnet" ] || continue
 
     offset=$(awk '
       /^network:/ { in_network=1; next }
@@ -60,15 +90,23 @@ next_ip_offset() {
     [[ "$offset" =~ ^[0-9]+$ ]] || continue
 
     count=$(host_count "$f")
-    end=$((offset + count))
-    [ "$end" -gt "$highest" ] && highest=$end
+    blocks+=("$offset $((offset + count))")
   done
 
-  if [ "$highest" -lt 10 ]; then
-    echo 10
-  else
-    echo $((highest + 10))
-  fi
+  cursor=$IP_OFFSET_MIN
+
+  while read -r start end; do
+    [ -n "$start" ] || continue
+    # Fits in the gap before this block, gap included.
+    [ $((cursor + need + IP_OFFSET_GAP)) -le "$start" ] && break
+    [ $((end + IP_OFFSET_GAP)) -gt "$cursor" ] && cursor=$((end + IP_OFFSET_GAP))
+  done < <(printf '%s\n' "${blocks[@]+"${blocks[@]}"}" | sort -n)
+  
+  [ $((cursor + need - 1)) -le "$IP_OFFSET_MAX" ] \
+    || fail "No free range of $need addresses left in $subnet below index $IP_OFFSET_MAX.
+Delete a setup that is no longer in use, pass IP_OFFSET=<n> to place this one by hand, or point SOURCE_CONFIG at a config in another subnet"
+
+  echo "$cursor"
 }
 
 # Emit "role<TAB>instance_type<TAB>disk_gb" for every host in a config, so a
@@ -143,9 +181,6 @@ derive_prefix() {
 [ -n "$SETUP" ] || fail "SETUP is required"
 [ "$SETUP" != "default" ] || fail "SETUP=default is reserved"
 [ -n "$DOMAIN" ] || DOMAIN="${SETUP}.local"
-[ -n "$IP_OFFSET" ] || IP_OFFSET="$(next_ip_offset)"
-[[ "$IP_OFFSET" =~ ^[0-9]+$ ]] || fail "IP_OFFSET must be a number"
-[ "$IP_OFFSET" -ge 2 ] || fail "IP_OFFSET must be >= 2"
 [ -f "$SOURCE_CONFIG" ] || fail "Source config not found: $SOURCE_CONFIG"
 [ -f "$SOURCE_SECRET" ] || fail "Source secret not found: $SOURCE_SECRET"
 
@@ -215,6 +250,25 @@ if [ -n "$DCS" ] || [ -n "$SERVERS" ] || [ -n "$CLIENTS" ]; then
     ' <<< "$source_sizing"
   }
 fi
+
+# Derived here rather than with the other defaults above because the gap it has
+# to fit in depends on how many hosts the setup ends up with.
+if [ -z "$IP_OFFSET" ]; then
+  if [ "$GENERATE_HOSTS" = 1 ]; then
+    ip_offset_hosts=$((SERVERS + CLIENTS))
+  else
+    ip_offset_hosts=$(host_count "$SOURCE_CONFIG")
+  fi
+
+  source_subnet="$(config_subnet_id "$SOURCE_CONFIG")"
+  [ -n "$source_subnet" ] || fail "No aws.subnet_id in $SOURCE_CONFIG — pass IP_OFFSET=<n>"
+
+  IP_OFFSET="$(next_ip_offset "$source_subnet" "$ip_offset_hosts")"
+fi
+[[ "$IP_OFFSET" =~ ^[0-9]+$ ]] || fail "IP_OFFSET must be a number"
+[ "$IP_OFFSET" -ge 2 ] || fail "IP_OFFSET must be >= 2"
+[ "$IP_OFFSET" -le "$IP_OFFSET_MAX" ] \
+  || fail "IP_OFFSET must be <= $IP_OFFSET_MAX to stay inside a /24"
 
 TARGET_CONFIG="$ROOT_DIR/config/${SETUP}.yml"
 TARGET_SECRET="$ROOT_DIR/terraform/secret.${SETUP}.tfvars"

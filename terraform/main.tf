@@ -75,8 +75,18 @@ locals {
   host_space        = pow(2, 32 - local.subnet_prefix_len)
   ip_start_offset   = try(local.network.ip_start_offset, 10)
 
-  candidate_ips = [
-    for i in range(local.ip_start_offset, local.host_space - 2) : cidrhost(data.aws_subnet.selected.cidr_block, i)
+  # One past the last index auto-assignment will hand out. The top two addresses
+  # of the block are the AWS-reserved and broadcast slots, so they never enter
+  # the pool.
+  ip_index_limit = local.host_space - 2
+
+  # The conditional is not redundant: range() counts *down* when its start is
+  # past its limit, so an offset beyond the subnet (say 256 on a /24) would
+  # otherwise produce [256, 255] and blow up inside cidrhost, in a locals block
+  # where no precondition can explain what went wrong. Returning an empty pool
+  # instead lets the offset precondition below report it.
+  candidate_ips = local.ip_start_offset >= local.ip_index_limit ? [] : [
+    for i in range(local.ip_start_offset, local.ip_index_limit) : cidrhost(data.aws_subnet.selected.cidr_block, i)
   ]
 
   # AUTO-ASSIGNMENT IS FOR INITIAL DEPLOYMENT ONLY.
@@ -284,6 +294,15 @@ resource "terraform_data" "validation" {
     }
 
     precondition {
+      condition = local.ip_start_offset < local.ip_index_limit
+      error_message = join("", [
+        "network.ip_start_offset (${local.ip_start_offset}) is outside subnet ${data.aws_subnet.selected.cidr_block}, ",
+        "whose auto-assignable host indexes stop at ${local.ip_index_limit - 1}. ",
+        "The subnet is full past the last setup's range — pick an offset in a free gap below it, or move this setup to a different subnet.",
+      ])
+    }
+
+    precondition {
       condition     = length(local.available_ips) >= length(local.unpinned_names)
       error_message = "Not enough available IP addresses in selected subnet for hosts without an explicit ip."
     }
@@ -425,10 +444,28 @@ resource "aws_ssm_document" "configure_networking" {
           "if (-not $adapter) { throw 'No active network adapter found after waiting' }",
           "$ifIndex = $adapter.IfIndex",
           "Set-NetIPInterface -InterfaceIndex $ifIndex -AddressFamily IPv4 -Dhcp Disabled -ErrorAction SilentlyContinue",
+          "# Disabling DHCP tears the lease down asynchronously, and AWS leases the",
+          "# ENI's own private address — the same one being set statically here. Reading",
+          "# the address list before the teardown lands therefore finds {{ StaticIp }}",
+          "# already present and takes the \"already configured\" path, skipping the",
+          "# New-NetIPAddress that carries -DefaultGateway. Moments later the lease goes",
+          "# away and the host is left with no address and no route: the SSM agent drops",
+          "# offline mid-script, so the association hangs in InProgress until Terraform",
+          "# times out and no log is ever uploaded to explain why.",
+          "$deadline = (Get-Date).AddSeconds(60)",
+          "while ((Get-Date) -lt $deadline) { if (-not (Get-NetIPAddress -InterfaceIndex $ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.PrefixOrigin -eq 'Dhcp' })) { break }; Start-Sleep -Seconds 2 }",
+          "# A lease still standing after the wait is removed outright, so the check",
+          "# below only ever sees addresses this document put there itself.",
+          "$leftoverDhcp = Get-NetIPAddress -InterfaceIndex $ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.PrefixOrigin -eq 'Dhcp' }",
+          "if ($leftoverDhcp) { $leftoverDhcp | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue }",
           "$existingTarget = Get-NetIPAddress -InterfaceIndex $ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -eq '{{ StaticIp }}' }",
           "if (-not $existingTarget) { New-NetIPAddress -InterfaceIndex $ifIndex -IPAddress '{{ StaticIp }}' -PrefixLength {{ PrefixLength }} -DefaultGateway '{{ Gateway }}' -AddressFamily IPv4 -ErrorAction Stop | Out-Null; Write-Host \"Set static IP {{ StaticIp }}/{{ PrefixLength }} gw {{ Gateway }}\" } else { Write-Host 'Static IP already configured' }",
-          "$oldDhcp = Get-NetIPAddress -InterfaceIndex $ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -ne '{{ StaticIp }}' -and $_.PrefixOrigin -eq 'Dhcp' }",
-          "if ($oldDhcp) { $oldDhcp | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue }",
+          "# The gateway rides along with New-NetIPAddress, so the branch that finds the",
+          "# address already in place never sets one. Re-running this document against a",
+          "# host that has been configured before then leaves it routable only inside its",
+          "# own subnet. Add the default route explicitly rather than depending on which",
+          "# branch above ran.",
+          "if (-not (Get-NetRoute -InterfaceIndex $ifIndex -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue)) { New-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $ifIndex -NextHop '{{ Gateway }}' -ErrorAction Stop | Out-Null; Write-Host 'Added default route via {{ Gateway }}' }",
           "$dns = '{{ DnsList }}'.Split(',')",
           "Set-DnsClientServerAddress -InterfaceIndex $ifIndex -ServerAddresses $dns",
           "if (-not (Get-NetRoute -DestinationPrefix '169.254.169.254/32' -ErrorAction SilentlyContinue)) { New-NetRoute -DestinationPrefix '169.254.169.254/32' -InterfaceIndex $ifIndex -NextHop '{{ Gateway }}' -RouteMetric 10 -ErrorAction SilentlyContinue }",
@@ -1232,21 +1269,19 @@ resource "aws_ssm_document" "credential_setup" {
           "if (Test-Path $dhcpRoleKey) { Set-ItemProperty -Path $dhcpRoleKey -Name ConfigurationState -Value 2 -Force; Write-Host 'DHCP post-deployment configuration marked complete' } else { Write-Host \"Server Manager DHCP role key $dhcpRoleKey not found - skipping completion flag\" }",
           "",
           "# Restart DHCP last, so the service comes up having picked up both the",
-          "# security groups created above and its AD authorization. A non-bootstrap",
-          "# host is authorized by the bootstrap host's run of this same phase, which",
-          "# runs in parallel, so wait briefly for that to land first: a service that",
-          "# starts unauthorized refuses to serve leases until the next rogue-detection",
-          "# sweep, an hour later by default.",
-          "$myFqdn = \"$env:COMPUTERNAME.{{ DomainFqdn }}\"",
-          "if (-not $toAuthorize) {",
-          "  for ($attempt = 1; $attempt -le 18; $attempt++) {",
-          "    if (Get-DhcpServerInDC | Where-Object { $_.DnsName -eq $myFqdn }) { Write-Host \"$myFqdn is authorized in AD\"; break }",
-          "    # A warning, not a throw: the bootstrap host's own run fails outright if",
-          "    # authorization is genuinely broken, so failing here too would only turn",
-          "    # one clear failure into a fleet-wide cascade.",
-          "    if ($attempt -eq 18) { Write-Host \"Warning: $myFqdn still not authorized after 3 minutes - restarting anyway, check the bootstrap host's credential_setup run\" } else { Write-Host \"Waiting for the bootstrap host to authorize $myFqdn ($attempt/18)...\"; Start-Sleep -Seconds 10 }",
-          "  }",
-          "}",
+          "# security groups created above and its AD authorization. A host that starts",
+          "# unauthorized refuses to serve leases until the next rogue-detection sweep,",
+          "# an hour later by default.",
+          "#",
+          "# Ordering is enforced in Terraform rather than waited on here:",
+          "# credential_setup_bootstrap authorizes every DHCP server in AD and verifies",
+          "# the whole list, and credential_setup_members does not start until it has",
+          "# succeeded. This used to be a poll on Get-DhcpServerInDC, which is the one",
+          "# cmdlet a member server can never run: SYSTEM there has no rights on the",
+          "# NetServices container, so the call fails outright with 'Access is denied'",
+          "# (WIN32 5) instead of returning a list without this host in it. Under",
+          "# $ErrorActionPreference = 'Stop' that aborted the phase at the poll, so the",
+          "# restart below and every step after it never ran on a member server.",
           "Restart-Service dhcpserver -Force",
           "$dhcpSvc = Get-Service dhcpserver",
           "if ($dhcpSvc.Status -ne 'Running') { throw \"DHCP Server service is $($dhcpSvc.Status) after restart on $(hostname)\" }",
@@ -1327,9 +1362,43 @@ resource "aws_ssm_document" "credential_setup" {
   })
 }
 
-resource "aws_ssm_association" "credential_setup" {
+# This phase runs in two waves, because one host has to write the whole setup's
+# DHCP authorization into AD before any other host restarts its DHCP service.
+#
+# The bootstrap host does that writing: SSM runs as SYSTEM, and a member server's
+# machine account has no rights on the NetServices container, so it can neither
+# authorize itself nor even read back whether someone else has. Having the member
+# servers wait on the bootstrap host in Terraform is what makes the ordering
+# observable — the alternative, polling AD from the member server, is not
+# something a member server is permitted to do at all.
+locals {
+  # Shared by both waves. Hoisted so the two associations cannot drift apart:
+  # TrustedHosts in particular has to name the same set on every host or WinRM
+  # rejects connections from the ones left out.
+  credential_setup_params = {
+    Username     = local.credentials.service_user
+    Password     = local.service_user_password
+    DomainFqdn   = local.domain.fqdn
+    TrustedHosts = join(",", [for name in local.server_hosts : local.effective_ip_by_host[name]])
+  }
+
+  # Every DHCP server in the setup, authorized in AD by the bootstrap host alone.
+  # Doing it from one host keeps the completeness check race-free, since the same
+  # run writes and verifies the whole list.
+  credential_setup_dhcp_servers = join(",", [
+    for name in distinct(concat(local.server_hosts, [local.bootstrap_host])) :
+    "${name}=${local.effective_ip_by_host[name]}"
+  ])
+
+  credential_setup_members = {
+    for name, vm in aws_instance.nodes :
+    name => vm if(contains(local.server_hosts, name) || name == local.bootstrap_host) && name != local.bootstrap_host
+  }
+}
+
+resource "aws_ssm_association" "credential_setup_bootstrap" {
   for_each = {
-    for name, vm in aws_instance.nodes : name => vm if contains(local.server_hosts, name) || name == local.bootstrap_host
+    for name, vm in aws_instance.nodes : name => vm if name == local.bootstrap_host
   }
 
   name = aws_ssm_document.credential_setup.name
@@ -1339,26 +1408,12 @@ resource "aws_ssm_association" "credential_setup" {
     values = [each.value.id]
   }
 
-  parameters = {
-    Username     = local.credentials.service_user
-    Password     = local.service_user_password
-    DomainFqdn   = local.domain.fqdn
-    TrustedHosts = join(",", [for name in local.server_hosts : local.effective_ip_by_host[name]])
-    # Selects the AD-group path over the local-group path. Promoting a host to a
-    # DC converts its local groups into domain groups, so any additional DC has
-    # to take the same branch as the bootstrap host once promotion is wired up.
-    IsDomainController = contains(local.domain_controllers, each.key) ? "true" : "false"
-    # Every DHCP server in the setup, authorized in AD by the bootstrap host alone.
-    # SSM runs as SYSTEM, so a member server cannot authorize itself: its machine
-    # account has no rights on the NetServices container. Doing it from one host
-    # also keeps the completeness check race-free, since the same run writes and
-    # verifies the whole list. "none" is a sentinel rather than an empty string,
-    # which SSM rejects as a parameter value.
-    DhcpServers = each.key == local.bootstrap_host ? join(",", [
-      for name in distinct(concat(local.server_hosts, [local.bootstrap_host])) :
-      "${name}=${local.effective_ip_by_host[name]}"
-    ]) : "none"
-  }
+  parameters = merge(local.credential_setup_params, {
+    # The bootstrap host is always a domain controller, so it always takes the
+    # AD-group path.
+    IsDomainController = "true"
+    DhcpServers        = local.credential_setup_dhcp_servers
+  })
 
   dynamic "output_location" {
     for_each = local.ssm_logs_enabled ? [1] : []
@@ -1368,9 +1423,6 @@ resource "aws_ssm_association" "credential_setup" {
     }
   }
 
-  # 900 rather than the 600 used by the other phases: a non-bootstrap host may
-  # wait up to 3 minutes for the bootstrap host to authorize it in AD before it
-  # restarts the DHCP service, on top of this phase's existing retry loops.
   wait_for_success_timeout_seconds = 900
 
   # Replacing an instance would otherwise leave this association in place and
@@ -1390,6 +1442,54 @@ resource "aws_ssm_association" "credential_setup" {
   # being replaced on its own. That is how de-dc02 came to run this phase while
   # the DHCP role was still installing.
   depends_on = [time_sleep.wait_for_features_reboot, time_sleep.wait_for_join_reboot, time_sleep.wait_for_promotion, aws_ssm_association.configure_promoted_dc]
+}
+
+resource "aws_ssm_association" "credential_setup_members" {
+  for_each = local.credential_setup_members
+
+  name = aws_ssm_document.credential_setup.name
+
+  targets {
+    key    = "InstanceIds"
+    values = [each.value.id]
+  }
+
+  parameters = merge(local.credential_setup_params, {
+    # Promoting a host to a DC converts its local groups into domain groups, so
+    # any additional DC has to take the same branch as the bootstrap host.
+    IsDomainController = contains(local.domain_controllers, each.key) ? "true" : "false"
+    # "none" is a sentinel rather than an empty string, which SSM rejects as a
+    # parameter value. Only the bootstrap host authorizes.
+    DhcpServers = "none"
+  })
+
+  dynamic "output_location" {
+    for_each = local.ssm_logs_enabled ? [1] : []
+    content {
+      s3_bucket_name = local.ssm_log_bucket
+      s3_key_prefix  = "${local.ssm_log_prefix}/credential-setup/${each.key}"
+    }
+  }
+
+  wait_for_success_timeout_seconds = 900
+
+  lifecycle {
+    replace_triggered_by = [aws_instance.nodes[each.key]]
+  }
+
+  # The edge onto credential_setup_bootstrap is what replaces the AD poll that
+  # used to live in the document. It only orders operations within one apply,
+  # which is exactly when it is needed: both waves are created together on a
+  # first apply, so the edge exists. On a later apply that touches only a member
+  # server, the bootstrap host authorized the fleet in an earlier apply and there
+  # is nothing left to wait for.
+  depends_on = [
+    aws_ssm_association.credential_setup_bootstrap,
+    time_sleep.wait_for_features_reboot,
+    time_sleep.wait_for_join_reboot,
+    time_sleep.wait_for_promotion,
+    aws_ssm_association.configure_promoted_dc,
+  ]
 }
 
 resource "time_sleep" "wait_for_join_reboot" {
@@ -1533,5 +1633,5 @@ resource "aws_ssm_association" "agent_setup" {
   # phase is then free to run in parallel with an install_windows_features that is
   # being replaced on its own. That is how de-dc02 came to run this phase while
   # the DHCP role was still installing.
-  depends_on = [time_sleep.wait_for_features_reboot, aws_ssm_association.credential_setup]
+  depends_on = [time_sleep.wait_for_features_reboot, aws_ssm_association.credential_setup_bootstrap, aws_ssm_association.credential_setup_members]
 }

@@ -81,9 +81,10 @@ fi
 if [[ -z "$HOST" ]]; then
   echo "Hosts with logs for phase: $PHASE"
   echo ""
-  aws s3 ls "${S3_BASE}/${PHASE}/" "${AWS_OPTS[@]}" 2>/dev/null \
+  # Same story as above, plus grep exits 1 when every line is filtered out.
+  (aws s3 ls "${S3_BASE}/${PHASE}/" "${AWS_OPTS[@]}" 2>/dev/null || true) \
     | awk '{print $NF}' | sed 's:/$::' \
-    | grep -v '^[0-9a-f]\{8\}-[0-9a-f]\{4\}-' \
+    | { grep -v '^[0-9a-f]\{8\}-[0-9a-f]\{4\}-' || true; } \
     | sort
   exit 0
 fi
@@ -91,12 +92,20 @@ fi
 # ── Phase + Host: show runs with timestamps ──────────────────────────────────
 LOG_PATH="${S3_BASE}/${PHASE}/${HOST}"
 
-# Collect all command invocation dirs (each command-id is a separate run)
-ALL_FILES=$(aws s3 ls "${LOG_PATH}/" "${AWS_OPTS[@]}" --recursive 2>/dev/null \
+# Collect all command invocation dirs (each command-id is a separate run).
+#
+# `aws s3 ls` exits 1 when the prefix has no objects, and under `set -e` +
+# pipefail that kills the script *at this assignment* — so the "No logs found"
+# message below never printed and `make logs` failed with a bare "Error 1".
+# A missing prefix is the normal answer for a phase that has not run yet.
+ALL_FILES=$( (aws s3 ls "${LOG_PATH}/" "${AWS_OPTS[@]}" --recursive 2>/dev/null || true) \
   | sort -k1,2)
 
 if [[ -z "$ALL_FILES" ]]; then
-  echo "No logs found at ${LOG_PATH}/"
+  echo "No logs found at ${LOG_PATH}/" >&2
+  echo "The phase may not have run yet, or it never reported back — SSM uploads a" >&2
+  echo "command's output only once it finishes, so a host that loses connectivity" >&2
+  echo "mid-script leaves no log at all. Check: make progress" >&2
   exit 1
 fi
 
