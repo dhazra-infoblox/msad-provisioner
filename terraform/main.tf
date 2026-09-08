@@ -165,13 +165,8 @@ resource "aws_iam_instance_profile" "ssm_instance_profile" {
   role = aws_iam_role.ssm_instance_role[0].name
 }
 
-data "aws_iam_instance_profile" "existing" {
-  count = local.use_existing_instance_profile ? 1 : 0
-  name  = local.aws_config.instance_profile_name
-}
-
 locals {
-  ssm_role_name = local.use_existing_instance_profile ? data.aws_iam_instance_profile.existing[0].role_name : aws_iam_role.ssm_instance_role[0].name
+  ssm_role_name = local.use_existing_instance_profile ? "" : aws_iam_role.ssm_instance_role[0].name
 }
 
 resource "aws_iam_role_policy" "ssm_s3_logs" {
