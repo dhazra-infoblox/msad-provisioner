@@ -176,6 +176,20 @@ locals {
 provider "aws" {
   region  = local.aws_config.region
   profile = local.aws_config.profile
+
+  # The account stamps Owner and PrincipalId onto every resource at creation
+  # time. Terraform never wrote them, so each plan proposes deleting them — and
+  # because every phase association carries replace_triggered_by on its
+  # instance, that one tag diff is enough to mark the instance as changed and
+  # re-fire rename, feature install and domain join against hosts that are
+  # already built. Ignoring the two keys keeps the instances clean in plan so
+  # only genuinely new phases run.
+  #
+  # Case matters here: the config's own tag map uses lowercase `owner`
+  # (msft-dhcp-team), which stays under Terraform's management.
+  ignore_tags {
+    keys = ["Owner", "PrincipalId"]
+  }
 }
 
 data "aws_caller_identity" "current" {}
